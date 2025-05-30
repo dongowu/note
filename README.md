@@ -1,5 +1,6 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/dongowu/note)
+[![ReadmeX](https://raw.githubusercontent.com/CodePhiliaX/resource-trusteeship/main/readmex.svg)](https://readmex.com/wdndev/llm_interview_note)
 # note
 ```
 ├─devOps
