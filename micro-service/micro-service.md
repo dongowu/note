@@ -156,48 +156,352 @@ func NewServer() *grpc.Server {
 }
 ```
 
-### 3.2 负载均衡策略
-#### 3.2.1自定义负载均衡实现
+### 3.2 负载均衡策略与实现
+
+#### 3.2.1 负载均衡算法详解
+
+**1. 轮询（Round Robin）算法**
+- 原理：按顺序循环选择服务实例，适用于实例性能相近的场景
+- Go实现：
+```go
+type RoundRobinBalancer struct {
+    instances []string
+    current   int64
+    mutex     sync.Mutex
+}
+
+func (rb *RoundRobinBalancer) Next() string {
+    rb.mutex.Lock()
+    defer rb.mutex.Unlock()
+    
+    if len(rb.instances) == 0 {
+        return ""
+    }
+    
+    instance := rb.instances[rb.current%int64(len(rb.instances))]
+    rb.current++
+    return instance
+}
+```
+
+**2. 加权轮询（Weighted Round Robin）算法**
+- 原理：根据实例权重分配请求，权重高的实例获得更多请求
+- Go实现：
+```go
+type WeightedInstance struct {
+    Address string
+    Weight  int
+    Current int
+}
+
+type WeightedRoundRobinBalancer struct {
+    instances []*WeightedInstance
+    mutex     sync.Mutex
+}
+
+func (wrb *WeightedRoundRobinBalancer) Next() string {
+    wrb.mutex.Lock()
+    defer wrb.mutex.Unlock()
+    
+    if len(wrb.instances) == 0 {
+        return ""
+    }
+    
+    totalWeight := 0
+    var selected *WeightedInstance
+    
+    for _, instance := range wrb.instances {
+        instance.Current += instance.Weight
+        totalWeight += instance.Weight
+        
+        if selected == nil || instance.Current > selected.Current {
+            selected = instance
+        }
+    }
+    
+    selected.Current -= totalWeight
+    return selected.Address
+}
+```
+
+**3. 一致性哈希（Consistent Hashing）算法**
+- 原理：通过哈希环实现请求与实例的稳定映射，适用于有状态服务或缓存场景
+- Go实现：
+```go
+import (
+    "crypto/sha1"
+    "fmt"
+    "sort"
+    "strconv"
+)
+
+type ConsistentHash struct {
+    replicas int
+    keys     []int // 哈希环上的点
+    hashMap  map[int]string // 哈希值到实例的映射
+}
+
+func NewConsistentHash(replicas int) *ConsistentHash {
+    return &ConsistentHash{
+        replicas: replicas,
+        hashMap:  make(map[int]string),
+    }
+}
+
+func (ch *ConsistentHash) hash(key string) int {
+    h := sha1.New()
+    h.Write([]byte(key))
+    hashBytes := h.Sum(nil)
+    // 取前4字节转换为int
+    return int(hashBytes[0])<<24 + int(hashBytes[1])<<16 + int(hashBytes[2])<<8 + int(hashBytes[3])
+}
+
+func (ch *ConsistentHash) Add(instances ...string) {
+    for _, instance := range instances {
+        for i := 0; i < ch.replicas; i++ {
+            hash := ch.hash(strconv.Itoa(i) + instance)
+            ch.keys = append(ch.keys, hash)
+            ch.hashMap[hash] = instance
+        }
+    }
+    sort.Ints(ch.keys)
+}
+
+func (ch *ConsistentHash) Get(key string) string {
+    if len(ch.keys) == 0 {
+        return ""
+    }
+    
+    hash := ch.hash(key)
+    // 二分查找第一个大于等于hash的位置
+    idx := sort.Search(len(ch.keys), func(i int) bool {
+        return ch.keys[i] >= hash
+    })
+    
+    // 如果没找到，选择第一个（环形）
+    if idx == len(ch.keys) {
+        idx = 0
+    }
+    
+    return ch.hashMap[ch.keys[idx]]
+}
+```
+
+**4. 最少连接数（Least Connections）算法**
+- 原理：选择当前活跃连接数最少的实例，适用于长连接场景
+- Go实现：
+```go
+type ConnectionTracker struct {
+    Address     string
+    Connections int64
+}
+
+type LeastConnectionsBalancer struct {
+    instances []*ConnectionTracker
+    mutex     sync.RWMutex
+}
+
+func (lcb *LeastConnectionsBalancer) Next() string {
+    lcb.mutex.RLock()
+    defer lcb.mutex.RUnlock()
+    
+    if len(lcb.instances) == 0 {
+        return ""
+    }
+    
+    var selected *ConnectionTracker
+    for _, instance := range lcb.instances {
+        if selected == nil || instance.Connections < selected.Connections {
+            selected = instance
+        }
+    }
+    
+    return selected.Address
+}
+
+func (lcb *LeastConnectionsBalancer) IncrementConnections(address string) {
+    lcb.mutex.Lock()
+    defer lcb.mutex.Unlock()
+    
+    for _, instance := range lcb.instances {
+        if instance.Address == address {
+            atomic.AddInt64(&instance.Connections, 1)
+            break
+        }
+    }
+}
+
+func (lcb *LeastConnectionsBalancer) DecrementConnections(address string) {
+    lcb.mutex.Lock()
+    defer lcb.mutex.Unlock()
+    
+    for _, instance := range lcb.instances {
+        if instance.Address == address {
+            atomic.AddInt64(&instance.Connections, -1)
+            break
+        }
+    }
+}
+```
+
+#### 3.2.2 自定义gRPC负载均衡实现
 Go中可通过实现`gRPC LB Policy`接口自定义调度逻辑，示例（基于实例CPU负载动态调整权重）：
 ```go
 import (
-    "github.com/grpc/grpc-go/balancer"
-    "github.com/grpc/grpc-go/balancer/base"
-    "github.com/shirou/gopsutil/v3/cpu"
+    "context"
+    "sync"
+    "google.golang.org/grpc/balancer"
+    "google.golang.org/grpc/balancer/base"
+    "google.golang.org/grpc/grpclog"
 )
 
 // 定义负载均衡策略名称
-const Name = "cpu_aware"
+const CPUAwareName = "cpu_aware"
 
 // 工厂函数注册策略
 func init() {
-    balancer.Register(base.NewBalancerBuilder(Name, &PickerBuilder{}, base.Config{}))
+    balancer.Register(base.NewBalancerBuilder(CPUAwareName, &CPUAwarePickerBuilder{}, base.Config{}))
 }
 
-// PickerBuilder 构建Picker
-type PickerBuilder struct{}
-func (*PickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
-    // 收集所有健康实例
-    var addrs []balancer.SubConn
-    for addr, conn := range info.ReadySCs {
-        addrs = append(addrs, conn)
+// CPUAwarePickerBuilder 构建Picker
+type CPUAwarePickerBuilder struct{}
+
+func (*CPUAwarePickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
+    grpclog.Infof("CPUAwarePicker: Build called with %d ready subconns", len(info.ReadySCs))
+    
+    if len(info.ReadySCs) == 0 {
+        return base.NewErrPicker(balancer.ErrNoSubConnAvailable)
     }
-    return &CustomPicker{instances: addrs}
+    
+    var subConns []balancer.SubConn
+    for subConn := range info.ReadySCs {
+        subConns = append(subConns, subConn)
+    }
+    
+    return &CPUAwarePicker{
+        subConns: subConns,
+        next:     0,
+    }
 }
 
-// CustomPicker 基于CPU负载的Picker
-type CustomPicker struct{
-    instances []balancer.SubConn
+// CPUAwarePicker 基于CPU负载的Picker
+type CPUAwarePicker struct {
+    subConns []balancer.SubConn
+    next     int
+    mu       sync.Mutex
 }
-func (p *CustomPicker) Pick(ctx context.Context, opts balancer.PickOptions) (balancer.SubConn, func(balancer.DoneInfo), error) {
-    // 获取各实例CPU负载（模拟实现）
-    minLoad, selected := 100.0, 0
-    for i, conn := range p.instances {
-        // 实际通过gRPC健康检查或Prometheus获取实例CPU负载
-        load, _ := cpu.Percent(0, false)
-        currentLoad := load[0]
-        if currentLoad < minLoad {
-            minLoad = currentLoad
+
+func (p *CPUAwarePicker) Pick(ctx context.Context, opts balancer.PickInfo) (balancer.PickResult, error) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    
+    if len(p.subConns) == 0 {
+        return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
+    }
+    
+    // 简化实现：轮询选择（实际应用中可集成CPU监控）
+    sc := p.subConns[p.next]
+    p.next = (p.next + 1) % len(p.subConns)
+    
+    return balancer.PickResult{
+        SubConn: sc,
+        Done: func(info balancer.DoneInfo) {
+            // 可在此处记录请求完成信息，用于后续负载均衡决策
+            if info.Err != nil {
+                grpclog.Warningf("RPC failed: %v", info.Err)
+            }
+        },
+    }, nil
+}
+
+// 客户端使用示例
+func ExampleCPUAwareBalancer() {
+    // 注册自定义负载均衡策略
+    conn, err := grpc.Dial(
+        "etcd:///service-name", // 使用etcd服务发现
+        grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"cpu_aware":{}}]}`),
+        grpc.WithInsecure(),
+    )
+    if err != nil {
+        log.Fatalf("Failed to connect: %v", err)
+    }
+    defer conn.Close()
+    
+    // 使用连接进行gRPC调用
+    client := pb.NewYourServiceClient(conn)
+    // ...
+}
+```
+
+#### 3.2.3 健康检查与故障转移
+
+**gRPC健康检查实现**：
+```go
+import (
+    "context"
+    "time"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/health"
+    "google.golang.org/grpc/health/grpc_health_v1"
+)
+
+// 服务端健康检查实现
+type HealthChecker struct {
+    server *health.Server
+}
+
+func NewHealthChecker() *HealthChecker {
+    return &HealthChecker{
+        server: health.NewServer(),
+    }
+}
+
+func (hc *HealthChecker) RegisterService(serviceName string) {
+    hc.server.SetServingStatus(serviceName, grpc_health_v1.HealthCheckResponse_SERVING)
+}
+
+func (hc *HealthChecker) SetUnhealthy(serviceName string) {
+    hc.server.SetServingStatus(serviceName, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+}
+
+// 客户端健康检查
+func CheckServiceHealth(conn *grpc.ClientConn, serviceName string) error {
+    client := grpc_health_v1.NewHealthClient(conn)
+    
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    resp, err := client.Check(ctx, &grpc_health_v1.HealthCheckRequest{
+        Service: serviceName,
+    })
+    if err != nil {
+        return err
+    }
+    
+    if resp.Status != grpc_health_v1.HealthCheckResponse_SERVING {
+        return fmt.Errorf("service %s is not healthy: %v", serviceName, resp.Status)
+    }
+    
+    return nil
+}
+```
+
+#### 3.2.4 负载均衡策略选择指南
+
+| 场景 | 推荐算法 | 原因 |
+|------|----------|------|
+| 无状态Web服务 | 轮询/加权轮询 | 简单高效，适合同质化实例 |
+| 数据库连接池 | 最少连接数 | 避免连接数不均衡 |
+| 缓存服务 | 一致性哈希 | 减少缓存失效，提高命中率 |
+| 计算密集型服务 | 基于CPU负载 | 根据实际负载动态调整 |
+| 长连接服务 | 最少连接数 | 平衡长连接分布 |
+
+**最佳实践**：
+- 结合服务特性选择合适的负载均衡算法
+- 实现健康检查机制，及时剔除故障实例
+- 监控负载均衡效果，根据实际情况调整策略
+- 考虑实例启动时间，避免将请求路由到未完全启动的实例
+- 实现优雅关闭，确保正在处理的请求能够完成
             selected = i
         }
     }
@@ -842,5 +1146,808 @@ resp, err := client.Get(context.Background(), key, clientv3.WithRev(100))
 - **TCC**：短事务、资源可预留（如电商下单扣库存、金融转账冻结）；  
 - **消息最终一致性**：异步通知（如支付成功通知物流）、允许最终一致（如用户积分变更）；  
 - **Saga**：长事务、业务可补偿（如跨多服务的大促活动流程）。
+
+## 8. 服务网格（Service Mesh）
+
+### 8.1 服务网格架构原理
+
+**服务网格核心概念**：
+- **数据平面（Data Plane）**：由轻量级代理组成，处理服务间的所有网络通信
+- **控制平面（Control Plane）**：管理和配置代理，提供策略和遥测收集
+- **边车模式（Sidecar Pattern）**：每个服务实例都伴随一个代理实例
+
+**服务网格解决的问题**：
+1. **服务间通信复杂性**：统一处理负载均衡、重试、超时等
+2. **可观测性**：提供分布式追踪、指标收集、日志聚合
+3. **安全性**：mTLS加密、访问控制、身份验证
+4. **流量管理**：灰度发布、A/B测试、故障注入
+
+### 8.2 Istio架构与实现
+
+#### 8.2.1 Istio核心组件详解
+
+**1. Envoy Proxy（数据平面）**
+- **功能**：L7代理，处理所有入站和出站流量
+- **特性**：动态配置、丰富的负载均衡算法、健康检查、断路器
+- **配置示例**：
+```yaml
+# Envoy配置片段
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address:
+        protocol: TCP
+        address: 0.0.0.0
+        port_value: 10000
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          access_log:
+          - name: envoy.access_loggers.stdout
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: local_service
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  host_rewrite_literal: www.google.com
+                  cluster: service_google
+  clusters:
+  - name: service_google
+    type: LOGICAL_DNS
+    dns_lookup_family: V4_ONLY
+    load_assignment:
+      cluster_name: service_google
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: www.google.com
+                port_value: 443
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: www.google.com
+```
+
+**2. Istiod（控制平面）**
+- **Pilot**：服务发现和流量管理
+- **Citadel**：证书管理和安全策略
+- **Galley**：配置验证和分发
+
+#### 8.2.2 流量管理实现
+
+**1. VirtualService（虚拟服务）**
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: user-service-vs
+  namespace: default
+spec:
+  hosts:
+  - user-service
+  http:
+  # 基于请求头的路由
+  - match:
+    - headers:
+        version:
+          exact: v2
+        user-type:
+          exact: premium
+    route:
+    - destination:
+        host: user-service
+        subset: v2
+    timeout: 10s
+    retries:
+      attempts: 3
+      perTryTimeout: 3s
+  # 基于权重的流量分割（金丝雀发布）
+  - match:
+    - uri:
+        prefix: "/api/v1/"
+    route:
+    - destination:
+        host: user-service
+        subset: v1
+      weight: 80
+    - destination:
+        host: user-service
+        subset: v2
+      weight: 20
+    fault:
+      delay:
+        percentage:
+          value: 0.1
+        fixedDelay: 5s
+  # 默认路由
+  - route:
+    - destination:
+        host: user-service
+        subset: v1
+```
+
+**2. DestinationRule（目标规则）**
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: user-service-dr
+spec:
+  host: user-service
+  trafficPolicy:
+    loadBalancer:
+      simple: LEAST_CONN
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 50
+        http2MaxRequests: 100
+        maxRequestsPerConnection: 2
+        maxRetries: 3
+        consecutiveGatewayErrors: 5
+        interval: 30s
+        baseEjectionTime: 30s
+        maxEjectionPercent: 50
+    outlierDetection:
+      consecutiveGatewayErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+    trafficPolicy:
+      loadBalancer:
+        simple: ROUND_ROBIN
+  - name: v2
+    labels:
+      version: v2
+    trafficPolicy:
+      loadBalancer:
+        simple: RANDOM
+```
+
+**3. Gateway（网关）**
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: user-service-gateway
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - user-service.example.com
+    tls:
+      httpsRedirect: true
+  - port:
+      number: 443
+      name: https
+      protocol: HTTPS
+    tls:
+      mode: SIMPLE
+      credentialName: user-service-tls
+    hosts:
+    - user-service.example.com
+```
+
+#### 8.2.3 安全策略实现
+
+**1. PeerAuthentication（对等身份验证）**
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT  # 强制mTLS
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: user-service-pa
+spec:
+  selector:
+    matchLabels:
+      app: user-service
+  mtls:
+    mode: PERMISSIVE  # 允许明文和mTLS
+  portLevelMtls:
+    8080:
+      mode: DISABLE  # 特定端口禁用mTLS
+```
+
+**2. AuthorizationPolicy（授权策略）**
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: user-service-authz
+spec:
+  selector:
+    matchLabels:
+      app: user-service
+  rules:
+  # 允许来自order-service的GET请求
+  - from:
+    - source:
+        principals: ["cluster.local/ns/default/sa/order-service"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/api/v1/users/*"]
+  # 允许管理员访问所有操作
+  - from:
+    - source:
+        requestPrincipals: ["*"]
+    when:
+    - key: request.auth.claims[role]
+      values: ["admin"]
+  # 拒绝所有其他请求
+  - {}
+```
+
+#### 8.2.4 可观测性配置
+
+**1. Telemetry配置**
+```yaml
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: user-service-metrics
+spec:
+  selector:
+    matchLabels:
+      app: user-service
+  metrics:
+  - providers:
+    - name: prometheus
+  - overrides:
+    - match:
+        metric: ALL_METRICS
+      tagOverrides:
+        request_id:
+          value: "%{REQUEST_ID}"
+        user_id:
+          value: "%{REQUEST_HEADERS['x-user-id']}"
+  accessLogging:
+  - providers:
+    - name: otel
+  tracing:
+  - providers:
+    - name: jaeger
+```
+
+**2. 分布式追踪集成**
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: istio
+  namespace: istio-system
+data:
+  mesh: |
+    defaultConfig:
+      proxyStatsMatcher:
+        inclusionRegexps:
+        - ".*outlier_detection.*"
+        - ".*circuit_breakers.*"
+        - ".*upstream_rq_retry.*"
+        - ".*_cx_.*"
+      tracing:
+        zipkin:
+          address: jaeger-collector.istio-system:9411
+        sampling: 100.0
+    extensionProviders:
+    - name: jaeger
+      envoyOtelAls:
+        service: jaeger-collector.istio-system
+        port: 14250
+```
+
+### 8.3 服务网格最佳实践
+
+#### 8.3.1 性能优化
+
+**1. 资源配置优化**
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: istio-proxy-config
+  namespace: istio-system
+data:
+  ProxyConfig: |
+    concurrency: 2  # 根据CPU核心数调整
+    proxyStatsMatcher:
+      exclusionRegexps:
+      - ".*osconfig.*"
+      - ".*wasm.*"
+    holdApplicationUntilProxyStarts: true
+```
+
+**2. 连接池调优**
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: performance-tuning
+spec:
+  host: "*.local"
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+        connectTimeout: 10s
+        tcpKeepalive:
+          time: 7200s
+          interval: 75s
+      http:
+        http1MaxPendingRequests: 64
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 10
+        maxRetries: 3
+        idleTimeout: 90s
+        h2UpgradePolicy: UPGRADE
+```
+
+#### 8.3.2 渐进式部署策略
+
+**1. 蓝绿部署**
+```yaml
+# 蓝绿部署VirtualService
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: blue-green-deployment
+spec:
+  hosts:
+  - user-service
+  http:
+  - match:
+    - headers:
+        deployment:
+          exact: green
+    route:
+    - destination:
+        host: user-service
+        subset: green
+  - route:
+    - destination:
+        host: user-service
+        subset: blue
+```
+
+**2. 金丝雀发布**
+```yaml
+# 金丝雀发布配置
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: canary-deployment
+spec:
+  hosts:
+  - user-service
+  http:
+  - match:
+    - headers:
+        canary:
+          exact: "true"
+    route:
+    - destination:
+        host: user-service
+        subset: canary
+  - route:
+    - destination:
+        host: user-service
+        subset: stable
+      weight: 95
+    - destination:
+        host: user-service
+        subset: canary
+      weight: 5
+```
+
+#### 8.3.3 故障注入与混沌工程
+
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: chaos-testing
+spec:
+  hosts:
+  - user-service
+  http:
+  - match:
+    - headers:
+        chaos-test:
+          exact: "delay"
+    fault:
+      delay:
+        percentage:
+          value: 100
+        fixedDelay: 5s
+    route:
+    - destination:
+        host: user-service
+  - match:
+    - headers:
+        chaos-test:
+          exact: "abort"
+    fault:
+      abort:
+        percentage:
+          value: 50
+        httpStatus: 500
+    route:
+    - destination:
+        host: user-service
+  - route:
+    - destination:
+        host: user-service
+```
+
+### 8.4 Go语言服务网格集成
+
+#### 8.4.1 服务注册与发现
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "net"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/health"
+    "google.golang.org/grpc/health/grpc_health_v1"
+    "google.golang.org/grpc/reflection"
+)
+
+// 服务注册到Istio服务网格
+func RegisterToServiceMesh(serviceName, serviceVersion string, port int) {
+    // 设置Pod标签，Istio通过标签识别服务版本
+    os.Setenv("SERVICE_NAME", serviceName)
+    os.Setenv("SERVICE_VERSION", serviceVersion)
+    
+    // 启动健康检查服务
+    healthServer := health.NewServer()
+    healthServer.SetServingStatus(serviceName, grpc_health_v1.HealthCheckResponse_SERVING)
+    
+    // 创建gRPC服务器
+    server := grpc.NewServer()
+    
+    // 注册健康检查服务
+    grpc_health_v1.RegisterHealthServer(server, healthServer)
+    
+    // 启用反射（用于服务发现）
+    reflection.Register(server)
+    
+    // 监听端口
+    lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+    if err != nil {
+        log.Fatalf("Failed to listen: %v", err)
+    }
+    
+    // 优雅关闭
+    go func() {
+        sigChan := make(chan os.Signal, 1)
+        signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+        <-sigChan
+        
+        log.Println("Shutting down server...")
+        healthServer.SetServingStatus(serviceName, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+        
+        // 等待现有连接完成
+        time.Sleep(5 * time.Second)
+        server.GracefulStop()
+    }()
+    
+    log.Printf("Server starting on port %d", port)
+    if err := server.Serve(lis); err != nil {
+        log.Fatalf("Failed to serve: %v", err)
+    }
+}
+```
+
+#### 8.4.2 分布式追踪集成
+
+```go
+package tracing
+
+import (
+    "context"
+    "io"
+    "log"
+    
+    "github.com/opentracing/opentracing-go"
+    "github.com/opentracing/opentracing-go/ext"
+    "github.com/uber/jaeger-client-go"
+    "github.com/uber/jaeger-client-go/config"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/metadata"
+)
+
+// 初始化Jaeger追踪
+func InitJaeger(serviceName string) (opentracing.Tracer, io.Closer, error) {
+    cfg := config.Configuration{
+        ServiceName: serviceName,
+        Sampler: &config.SamplerConfig{
+            Type:  jaeger.SamplerTypeConst,
+            Param: 1,
+        },
+        Reporter: &config.ReporterConfig{
+            LogSpans:            true,
+            BufferFlushInterval: 1 * time.Second,
+            LocalAgentHostPort:  "jaeger-agent:6831",
+        },
+    }
+    
+    tracer, closer, err := cfg.NewTracer()
+    if err != nil {
+        return nil, nil, err
+    }
+    
+    opentracing.SetGlobalTracer(tracer)
+    return tracer, closer, nil
+}
+
+// gRPC客户端追踪拦截器
+func TracingClientInterceptor() grpc.UnaryClientInterceptor {
+    return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+        span, ctx := opentracing.StartSpanFromContext(ctx, method)
+        defer span.Finish()
+        
+        // 设置span标签
+        ext.SpanKindRPCClient.Set(span)
+        ext.Component.Set(span, "grpc")
+        span.SetTag("grpc.method", method)
+        
+        // 注入追踪信息到gRPC metadata
+        md, ok := metadata.FromOutgoingContext(ctx)
+        if !ok {
+            md = metadata.New(nil)
+        }
+        
+        err := opentracing.GlobalTracer().Inject(
+            span.Context(),
+            opentracing.TextMap,
+            MetadataTextMap(md),
+        )
+        if err != nil {
+            log.Printf("Failed to inject span context: %v", err)
+        }
+        
+        ctx = metadata.NewOutgoingContext(ctx, md)
+        
+        // 执行RPC调用
+        err = invoker(ctx, method, req, reply, cc, opts...)
+        if err != nil {
+            ext.Error.Set(span, true)
+            span.SetTag("error.message", err.Error())
+        }
+        
+        return err
+    }
+}
+
+// gRPC服务端追踪拦截器
+func TracingServerInterceptor() grpc.UnaryServerInterceptor {
+    return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+        md, ok := metadata.FromIncomingContext(ctx)
+        if !ok {
+            md = metadata.New(nil)
+        }
+        
+        // 提取追踪信息
+        spanContext, err := opentracing.GlobalTracer().Extract(
+            opentracing.TextMap,
+            MetadataTextMap(md),
+        )
+        
+        var span opentracing.Span
+        if err != nil {
+            span = opentracing.StartSpan(info.FullMethod)
+        } else {
+            span = opentracing.StartSpan(info.FullMethod, opentracing.ChildOf(spanContext))
+        }
+        defer span.Finish()
+        
+        // 设置span标签
+        ext.SpanKindRPCServer.Set(span)
+        ext.Component.Set(span, "grpc")
+        span.SetTag("grpc.method", info.FullMethod)
+        
+        ctx = opentracing.ContextWithSpan(ctx, span)
+        
+        // 执行处理器
+        resp, err := handler(ctx, req)
+        if err != nil {
+            ext.Error.Set(span, true)
+            span.SetTag("error.message", err.Error())
+        }
+        
+        return resp, err
+    }
+}
+
+// Metadata到TextMap的适配器
+type MetadataTextMap metadata.MD
+
+func (m MetadataTextMap) Set(key, val string) {
+    metadata.MD(m)[key] = []string{val}
+}
+
+func (m MetadataTextMap) ForeachKey(handler func(key, val string) error) error {
+    for k, vals := range metadata.MD(m) {
+        for _, v := range vals {
+            if err := handler(k, v); err != nil {
+                return err
+            }
+        }
+    }
+    return nil
+}
+```
+
+### 8.5 服务网格面试要点
+
+#### 8.5.1 常见面试问题
+
+**1. 服务网格与传统微服务架构的区别？**
+- **传统架构**：服务间通信逻辑耦合在业务代码中，需要每个服务自己处理负载均衡、重试、监控等
+- **服务网格**：将通信逻辑下沉到基础设施层（Sidecar代理），业务代码专注业务逻辑
+- **优势**：语言无关、配置统一、可观测性增强、安全策略集中管理
+
+**2. Istio的数据平面和控制平面分别负责什么？**
+- **数据平面（Envoy Proxy）**：处理实际的服务间通信，包括负载均衡、健康检查、指标收集
+- **控制平面（Istiod）**：管理配置分发、证书管理、服务发现、策略执行
+- **交互方式**：控制平面通过xDS协议向数据平面推送配置更新
+
+**3. 如何实现金丝雀发布？**
+- 通过VirtualService配置流量权重分配（如90%流量到稳定版本，10%到金丝雀版本）
+- 结合DestinationRule定义服务子集（基于Pod标签区分版本）
+- 监控关键指标（错误率、响应时间），根据结果调整流量比例
+
+**4. mTLS在服务网格中如何工作？**
+- **证书管理**：Istio自动为每个服务生成和轮换证书
+- **身份验证**：基于SPIFFE标准，使用服务账户作为身份标识
+- **加密通信**：所有服务间通信自动加密，无需修改应用代码
+- **策略控制**：可配置STRICT/PERMISSIVE/DISABLE模式
+
+**5. 服务网格的性能开销如何？**
+- **延迟开销**：通常增加1-3ms延迟（Sidecar代理处理）
+- **资源开销**：每个Pod额外消耗50-100MB内存，0.1-0.2 CPU核心
+- **优化策略**：调整代理并发数、禁用不必要的功能、使用连接池
+
+#### 8.5.2 架构设计问题
+
+**场景：设计一个电商系统的服务网格架构**
+
+**核心服务识别**：
+- 用户服务（user-service）
+- 商品服务（product-service）
+- 订单服务（order-service）
+- 支付服务（payment-service）
+- 库存服务（inventory-service）
+
+**流量管理策略**：
+```yaml
+# 订单服务的流量路由
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: order-service-routing
+spec:
+  hosts:
+  - order-service
+  http:
+  # VIP用户优先路由到高性能实例
+  - match:
+    - headers:
+        user-level:
+          exact: vip
+    route:
+    - destination:
+        host: order-service
+        subset: high-performance
+  # 大促期间限制非核心功能
+  - match:
+    - uri:
+        prefix: "/api/v1/orders/history"
+    fault:
+      delay:
+        percentage:
+          value: 50
+        fixedDelay: 2s
+    route:
+    - destination:
+        host: order-service
+        subset: standard
+  # 默认路由
+  - route:
+    - destination:
+        host: order-service
+        subset: standard
+```
+
+**安全策略设计**：
+```yaml
+# 支付服务的严格访问控制
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: payment-service-authz
+spec:
+  selector:
+    matchLabels:
+      app: payment-service
+  rules:
+  # 只允许订单服务调用支付接口
+  - from:
+    - source:
+        principals: ["cluster.local/ns/default/sa/order-service"]
+    to:
+    - operation:
+        methods: ["POST"]
+        paths: ["/api/v1/payments"]
+  # 允许管理员查询支付状态
+  - from:
+    - source:
+        requestPrincipals: ["*"]
+    when:
+    - key: request.auth.claims[role]
+      values: ["admin"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/api/v1/payments/*"]
+```
+
+**监控与可观测性**：
+- **指标收集**：通过Prometheus收集服务调用指标、错误率、延迟分布
+- **分布式追踪**：使用Jaeger追踪跨服务的请求链路
+- **日志聚合**：通过Fluentd收集访问日志和错误日志
+- **告警策略**：设置关键指标阈值（如错误率>5%、P99延迟>500ms）
+
+**最佳实践总结**：
+1. **渐进式迁移**：先迁移边缘服务，再迁移核心服务
+2. **配置管理**：使用GitOps管理Istio配置，确保版本可追溯
+3. **性能监控**：持续监控服务网格的性能影响，及时优化
+4. **安全加固**：启用mTLS，配置细粒度的访问控制策略
+5. **故障演练**：定期进行混沌工程测试，验证容错能力
 
         
