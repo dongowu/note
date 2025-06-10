@@ -35,7 +35,7 @@ jobs:
       - name: Get files to sync
         id: changed-files
         if: github.event.inputs.sync_type != 'full'
-        uses: tj-actions/changed-files@v39
+        uses: tj-actions/changed-files@v46
         with:
           files: |
             **/*.md
