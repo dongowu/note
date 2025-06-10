@@ -66,7 +66,14 @@ jobs:
       - name: Test Vercel Service
         run: |
           echo "Testing Vercel service connection..."
+          # 测试 GET 请求
           curl -v "${{ secrets.VERCEL_SYNC_URL }}" || true
+          # 测试 OPTIONS 请求
+          curl -v -X OPTIONS "${{ secrets.VERCEL_SYNC_URL }}" || true
+          # 测试 POST 请求
+          curl -v -X POST "${{ secrets.VERCEL_SYNC_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{"test": "test"}' || true
 
       - name: Sync files to Notion
         run: |
