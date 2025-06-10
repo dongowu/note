@@ -49,13 +49,19 @@ jobs:
         id: all-files
         if: github.event.inputs.sync_type == 'full'
         run: |
-          echo "files=$(find . -type f \( -name "*.md" -o -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \) | sed 's|^\./||')" >> $GITHUB_OUTPUT
+          # 使用 find 命令查找所有匹配的文件
+          find . -type f \( -name "*.md" -o -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \) | sed 's|^\./||' > files.txt
+          # 将文件列表保存到环境变量
+          echo "FILES<<EOF" >> $GITHUB_ENV
+          cat files.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
       - name: Debug Files
         run: |
           if [ "${{ github.event.inputs.sync_type }}" = "full" ]; then
             echo "Syncing all files"
-            echo "Files to sync: ${{ steps.all-files.outputs.files }}"
+            echo "Files to sync:"
+            cat files.txt
           else
             echo "Syncing changed files"
             echo "Any files changed: ${{ steps.changed-files.outputs.any_changed }}"
@@ -75,36 +81,62 @@ jobs:
           fi
 
           if [ "${{ github.event.inputs.sync_type }}" = "full" ]; then
-            files="${{ steps.all-files.outputs.files }}"
-          else
-            files="${{ steps.changed-files.outputs.all_changed_files }}"
-          fi
-
-          for file in $files; do
-            if [ -f "$file" ]; then
-              echo "Processing file: $file"
-              content=$(cat "$file" | base64 -w 0)
-              echo "Sending request to: ${{ secrets.VERCEL_SYNC_URL }}"
-              response=$(curl -v -s -w "\n%{http_code}" -X POST ${{ secrets.VERCEL_SYNC_URL }} \
-                -H "Content-Type: application/json" \
-                -d "{
-                  \"notion_token\": \"${{ secrets.NOTION_TOKEN }}\",
-                  \"github_token\": \"${{ secrets.GITHUB_TOKEN }}\",
-                  \"repo_name\": \"${{ github.repository }}\",
-                  \"file_path\": \"$file\",
-                  \"content\": \"$content\",
-                  \"file_pattern\": \"**/*.{md,py,js,ts,jsx,tsx}\"
-                }")
-              
-              status_code=$(echo "$response" | tail -n1)
-              body=$(echo "$response" | sed '$d')
-              
-              echo "Response status: $status_code"
-              echo "Response body: $body"
-              
-              if [ "$status_code" != "200" ]; then
-                echo "Error syncing file $file"
-                exit 1
+            # 从文件中读取文件列表
+            while IFS= read -r file; do
+              if [ -f "$file" ]; then
+                echo "Processing file: $file"
+                content=$(cat "$file" | base64 -w 0)
+                echo "Sending request to: ${{ secrets.VERCEL_SYNC_URL }}"
+                response=$(curl -v -s -w "\n%{http_code}" -X POST ${{ secrets.VERCEL_SYNC_URL }} \
+                  -H "Content-Type: application/json" \
+                  -d "{
+                    \"notion_token\": \"${{ secrets.NOTION_TOKEN }}\",
+                    \"github_token\": \"${{ secrets.GITHUB_TOKEN }}\",
+                    \"repo_name\": \"${{ github.repository }}\",
+                    \"file_path\": \"$file\",
+                    \"content\": \"$content\",
+                    \"file_pattern\": \"**/*.{md,py,js,ts,jsx,tsx}\"
+                  }")
+                
+                status_code=$(echo "$response" | tail -n1)
+                body=$(echo "$response" | sed '$d')
+                
+                echo "Response status: $status_code"
+                echo "Response body: $body"
+                
+                if [ "$status_code" != "200" ]; then
+                  echo "Error syncing file $file"
+                  exit 1
+                fi
               fi
-            fi
-          done 
+            done < files.txt
+          else
+            # 处理更改的文件
+            for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+              if [ -f "$file" ]; then
+                echo "Processing file: $file"
+                content=$(cat "$file" | base64 -w 0)
+                echo "Sending request to: ${{ secrets.VERCEL_SYNC_URL }}"
+                response=$(curl -v -s -w "\n%{http_code}" -X POST ${{ secrets.VERCEL_SYNC_URL }} \
+                  -H "Content-Type: application/json" \
+                  -d "{
+                    \"notion_token\": \"${{ secrets.NOTION_TOKEN }}\",
+                    \"github_token\": \"${{ secrets.GITHUB_TOKEN }}\",
+                    \"repo_name\": \"${{ github.repository }}\",
+                    \"file_path\": \"$file\",
+                    \"content\": \"$content\",
+                    \"file_pattern\": \"**/*.{md,py,js,ts,jsx,tsx}\"
+                  }")
+                
+                status_code=$(echo "$response" | tail -n1)
+                body=$(echo "$response" | sed '$d')
+                
+                echo "Response status: $status_code"
+                echo "Response body: $body"
+                
+                if [ "$status_code" != "200" ]; then
+                  echo "Error syncing file $file"
+                  exit 1
+                fi
+              fi
+            done 
