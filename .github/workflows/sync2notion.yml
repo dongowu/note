@@ -4,6 +4,15 @@ on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      sync_type:
+        description: 'Sync type (full or partial)'
+        required: true
+        default: 'partial'
+        type: choice
+        options:
+          - full
+          - partial
 
 jobs:
   sync:
@@ -14,14 +23,18 @@ jobs:
           echo "Event name: ${{ github.event_name }}"
           echo "Branch: ${{ github.ref }}"
           echo "Repository: ${{ github.repository }}"
+          echo "Vercel URL: ${{ secrets.VERCEL_SYNC_URL }}"
+          echo "Notion Token exists: ${{ secrets.NOTION_TOKEN != '' }}"
+          echo "Sync type: ${{ github.event.inputs.sync_type || 'partial' }}"
 
       - uses: actions/checkout@v3
         with:
-          fetch-depth: 0  # Fetch all history for git diff
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get changed files
+      - name: Get files to sync
         id: changed-files
+        if: github.event.inputs.sync_type != 'full'
         uses: tj-actions/changed-files@v39
         with:
           files: |
@@ -32,13 +45,24 @@ jobs:
             **/*.jsx
             **/*.tsx
 
-      - name: Debug Changed Files
+      - name: Get all files
+        id: all-files
+        if: github.event.inputs.sync_type == 'full'
         run: |
-          echo "Any files changed: ${{ steps.changed-files.outputs.any_changed }}"
-          echo "Changed files: ${{ steps.changed-files.outputs.all_changed_files }}"
+          echo "files=$(find . -type f \( -name "*.md" -o -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \) | sed 's|^\./||')" >> $GITHUB_OUTPUT
+
+      - name: Debug Files
+        run: |
+          if [ "${{ github.event.inputs.sync_type }}" = "full" ]; then
+            echo "Syncing all files"
+            echo "Files to sync: ${{ steps.all-files.outputs.files }}"
+          else
+            echo "Syncing changed files"
+            echo "Any files changed: ${{ steps.changed-files.outputs.any_changed }}"
+            echo "Changed files: ${{ steps.changed-files.outputs.all_changed_files }}"
+          fi
 
       - name: Sync files to Notion
-        if: steps.changed-files.outputs.any_changed == 'true'
         run: |
           if [ -z "${{ secrets.VERCEL_SYNC_URL }}" ]; then
             echo "Error: VERCEL_SYNC_URL is not set"
@@ -50,11 +74,18 @@ jobs:
             exit 1
           fi
 
-          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+          if [ "${{ github.event.inputs.sync_type }}" = "full" ]; then
+            files="${{ steps.all-files.outputs.files }}"
+          else
+            files="${{ steps.changed-files.outputs.all_changed_files }}"
+          fi
+
+          for file in $files; do
             if [ -f "$file" ]; then
               echo "Processing file: $file"
               content=$(cat "$file" | base64 -w 0)
-              response=$(curl -s -w "\n%{http_code}" -X POST ${{ secrets.VERCEL_SYNC_URL }} \
+              echo "Sending request to: ${{ secrets.VERCEL_SYNC_URL }}"
+              response=$(curl -v -s -w "\n%{http_code}" -X POST ${{ secrets.VERCEL_SYNC_URL }} \
                 -H "Content-Type: application/json" \
                 -d "{
                   \"notion_token\": \"${{ secrets.NOTION_TOKEN }}\",
