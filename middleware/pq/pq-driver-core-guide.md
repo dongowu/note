@@ -1421,4 +1421,1470 @@ func TestUserRepository(t *testing.T) {
 }
 ```
 
-这个文档提供了pq驱动的全面技术指南，涵盖了核心原理、组件、优缺点、使用场景和最佳实践。接下来我将创建更多专门的文档来补充面试资料。
+## 十、深度技术原理解析
+
+### 1. PostgreSQL协议深度剖析
+
+#### 前后端协议交互流程
+```go
+// PostgreSQL协议消息类型详解
+type MessageType byte
+
+const (
+    // 认证相关
+    AuthenticationOK                = 'R'
+    AuthenticationKerberosV5        = 'R'
+    AuthenticationCleartextPassword = 'R'
+    AuthenticationMD5Password       = 'R'
+    AuthenticationSCMCredential     = 'R'
+    AuthenticationGSS               = 'R'
+    AuthenticationSSPI              = 'R'
+    AuthenticationGSSContinue       = 'R'
+    
+    // 查询相关
+    Query                = 'Q'
+    Parse                = 'P'
+    Bind                 = 'B'
+    Execute              = 'E'
+    Describe             = 'D'
+    Close                = 'C'
+    Sync                 = 'S'
+    
+    // 响应相关
+    CommandComplete      = 'C'
+    DataRow              = 'D'
+    EmptyQueryResponse   = 'I'
+    ErrorResponse        = 'E'
+    ReadyForQuery        = 'Z'
+    RowDescription       = 'T'
+    ParameterStatus      = 'S'
+    BackendKeyData       = 'K'
+    NoticeResponse       = 'N'
+    NotificationResponse = 'A'
+)
+
+// 协议状态机实现
+type ProtocolState int
+
+const (
+    StateStartup ProtocolState = iota
+    StateAuthentication
+    StateReady
+    StateQuery
+    StateTransaction
+    StateError
+    StateClosed
+)
+
+type Connection struct {
+    conn     net.Conn
+    state    ProtocolState
+    backend  BackendKeyData
+    params   map[string]string
+    txStatus byte
+}
+
+// 扩展查询协议实现
+func (c *Connection) ExtendedQuery(query string, params []interface{}) (*Result, error) {
+    // 1. Parse阶段
+    parseMsg := &ParseMessage{
+        Name:  "",
+        Query: query,
+        Types: extractParamTypes(params),
+    }
+    if err := c.sendMessage(parseMsg); err != nil {
+        return nil, err
+    }
+    
+    // 2. Bind阶段
+    bindMsg := &BindMessage{
+        Portal:    "",
+        Statement: "",
+        Params:    params,
+    }
+    if err := c.sendMessage(bindMsg); err != nil {
+        return nil, err
+    }
+    
+    // 3. Execute阶段
+    execMsg := &ExecuteMessage{
+        Portal:  "",
+        MaxRows: 0, // 0表示无限制
+    }
+    if err := c.sendMessage(execMsg); err != nil {
+        return nil, err
+    }
+    
+    // 4. Sync阶段
+    if err := c.sendMessage(&SyncMessage{}); err != nil {
+        return nil, err
+    }
+    
+    return c.readQueryResult()
+}
+```
+
+#### 连接池底层实现原理
+```go
+// 高性能连接池实现
+type AdvancedConnectionPool struct {
+    mu          sync.RWMutex
+    idle        []*poolConn
+    active      map[*poolConn]bool
+    maxOpen     int
+    maxIdle     int
+    maxLifetime time.Duration
+    maxIdleTime time.Duration
+    
+    // 统计信息
+    stats       PoolStats
+    
+    // 连接工厂
+    factory     func() (*sql.DB, error)
+    
+    // 健康检查
+    healthCheck func(*poolConn) bool
+    
+    // 监控回调
+    onConnect    func(*poolConn)
+    onDisconnect func(*poolConn)
+    onError      func(error)
+}
+
+type poolConn struct {
+    conn        *sql.DB
+    createdAt   time.Time
+    lastUsedAt  time.Time
+    usageCount  int64
+    inUse       bool
+}
+
+type PoolStats struct {
+    OpenConnections     int64
+    InUseConnections    int64
+    IdleConnections     int64
+    WaitCount          int64
+    WaitDuration       time.Duration
+    MaxOpenConnections int64
+    MaxIdleConnections int64
+    MaxLifetime        time.Duration
+}
+
+// 智能连接获取算法
+func (p *AdvancedConnectionPool) GetConnection(ctx context.Context) (*poolConn, error) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    
+    // 1. 尝试从空闲连接池获取
+    if len(p.idle) > 0 {
+        conn := p.idle[len(p.idle)-1]
+        p.idle = p.idle[:len(p.idle)-1]
+        
+        // 健康检查
+        if p.healthCheck != nil && !p.healthCheck(conn) {
+            conn.conn.Close()
+            return p.createNewConnection(ctx)
+        }
+        
+        // 检查连接生命周期
+        if p.maxLifetime > 0 && time.Since(conn.createdAt) > p.maxLifetime {
+            conn.conn.Close()
+            return p.createNewConnection(ctx)
+        }
+        
+        // 检查空闲时间
+        if p.maxIdleTime > 0 && time.Since(conn.lastUsedAt) > p.maxIdleTime {
+            conn.conn.Close()
+            return p.createNewConnection(ctx)
+        }
+        
+        conn.inUse = true
+        conn.lastUsedAt = time.Now()
+        conn.usageCount++
+        p.active[conn] = true
+        
+        return conn, nil
+    }
+    
+    // 2. 检查是否可以创建新连接
+    if len(p.active) < p.maxOpen {
+        return p.createNewConnection(ctx)
+    }
+    
+    // 3. 等待连接可用
+    return p.waitForConnection(ctx)
+}
+
+// 连接预热机制
+func (p *AdvancedConnectionPool) WarmUp(ctx context.Context, minConnections int) error {
+    var wg sync.WaitGroup
+    errCh := make(chan error, minConnections)
+    
+    for i := 0; i < minConnections; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            
+            conn, err := p.createNewConnection(ctx)
+            if err != nil {
+                errCh <- err
+                return
+            }
+            
+            p.ReturnConnection(conn)
+        }()
+    }
+    
+    wg.Wait()
+    close(errCh)
+    
+    for err := range errCh {
+        if err != nil {
+            return err
+        }
+    }
+    
+    return nil
+}
+```
+
+### 2. 事务隔离级别深度实现
+
+#### MVCC机制在pq中的应用
+```go
+// 事务隔离级别管理器
+type TransactionManager struct {
+    db           *sql.DB
+    isolation    sql.IsolationLevel
+    readOnly     bool
+    deferrable   bool
+}
+
+// 高级事务控制
+func (tm *TransactionManager) BeginAdvanced(ctx context.Context, opts *TxOptions) (*AdvancedTx, error) {
+    // 构建事务开始语句
+    var parts []string
+    parts = append(parts, "BEGIN")
+    
+    // 设置隔离级别
+    switch opts.Isolation {
+    case sql.LevelReadUncommitted:
+        parts = append(parts, "ISOLATION LEVEL READ UNCOMMITTED")
+    case sql.LevelReadCommitted:
+        parts = append(parts, "ISOLATION LEVEL READ COMMITTED")
+    case sql.LevelRepeatableRead:
+        parts = append(parts, "ISOLATION LEVEL REPEATABLE READ")
+    case sql.LevelSerializable:
+        parts = append(parts, "ISOLATION LEVEL SERIALIZABLE")
+    }
+    
+    // 设置读写模式
+    if opts.ReadOnly {
+        parts = append(parts, "READ ONLY")
+    } else {
+        parts = append(parts, "READ WRITE")
+    }
+    
+    // 设置可延迟性（仅对序列化隔离级别有效）
+    if opts.Deferrable && opts.Isolation == sql.LevelSerializable {
+        parts = append(parts, "DEFERRABLE")
+    }
+    
+    beginSQL := strings.Join(parts, " ")
+    
+    tx, err := tm.db.BeginTx(ctx, &sql.TxOptions{
+        Isolation: opts.Isolation,
+        ReadOnly:  opts.ReadOnly,
+    })
+    if err != nil {
+        return nil, err
+    }
+    
+    // 执行自定义BEGIN语句
+    if _, err := tx.ExecContext(ctx, beginSQL); err != nil {
+        tx.Rollback()
+        return nil, err
+    }
+    
+    return &AdvancedTx{
+        Tx:      tx,
+        opts:    opts,
+        started: time.Now(),
+    }, nil
+}
+
+// 序列化冲突处理
+func (tm *TransactionManager) ExecuteWithSerializationRetry(
+    ctx context.Context,
+    maxRetries int,
+    fn func(*sql.Tx) error,
+) error {
+    for attempt := 0; attempt < maxRetries; attempt++ {
+        tx, err := tm.BeginAdvanced(ctx, &TxOptions{
+            Isolation: sql.LevelSerializable,
+        })
+        if err != nil {
+            return err
+        }
+        
+        err = fn(tx.Tx)
+        if err != nil {
+            tx.Rollback()
+            
+            // 检查是否为序列化冲突
+            if pqErr, ok := err.(*pq.Error); ok {
+                if pqErr.Code == "40001" { // serialization_failure
+                    // 指数退避重试
+                    backoff := time.Duration(math.Pow(2, float64(attempt))) * 10 * time.Millisecond
+                    select {
+                    case <-ctx.Done():
+                        return ctx.Err()
+                    case <-time.After(backoff):
+                        continue
+                    }
+                }
+            }
+            
+            return err
+        }
+        
+        if err := tx.Commit(); err != nil {
+            // 提交时的序列化冲突
+            if pqErr, ok := err.(*pq.Error); ok {
+                if pqErr.Code == "40001" {
+                    continue
+                }
+            }
+            return err
+        }
+        
+        return nil
+    }
+    
+    return fmt.Errorf("transaction failed after %d attempts", maxRetries)
+}
+```
+
+### 3. 高性能批量操作实现
+
+#### COPY协议优化实现
+```go
+// 高性能COPY实现
+type BulkCopyManager struct {
+    db          *sql.DB
+    bufferSize  int
+    workerCount int
+    batchSize   int
+}
+
+// 并行批量插入
+func (bcm *BulkCopyManager) BulkInsertParallel(
+    ctx context.Context,
+    tableName string,
+    columns []string,
+    data <-chan []interface{},
+) error {
+    // 创建工作池
+    var wg sync.WaitGroup
+    errCh := make(chan error, bcm.workerCount)
+    
+    // 数据分发通道
+    batches := make(chan [][]interface{}, bcm.workerCount)
+    
+    // 启动工作协程
+    for i := 0; i < bcm.workerCount; i++ {
+        wg.Add(1)
+        go func(workerID int) {
+            defer wg.Done()
+            
+            for batch := range batches {
+                if err := bcm.processBatch(ctx, tableName, columns, batch); err != nil {
+                    errCh <- fmt.Errorf("worker %d: %w", workerID, err)
+                    return
+                }
+            }
+        }(i)
+    }
+    
+    // 数据分批
+    go func() {
+        defer close(batches)
+        
+        var batch [][]interface{}
+        for row := range data {
+            batch = append(batch, row)
+            
+            if len(batch) >= bcm.batchSize {
+                select {
+                case batches <- batch:
+                    batch = nil
+                case <-ctx.Done():
+                    return
+                }
+            }
+        }
+        
+        // 处理剩余数据
+        if len(batch) > 0 {
+            select {
+            case batches <- batch:
+            case <-ctx.Done():
+            }
+        }
+    }()
+    
+    // 等待完成
+    wg.Wait()
+    close(errCh)
+    
+    // 检查错误
+    for err := range errCh {
+        if err != nil {
+            return err
+        }
+    }
+    
+    return nil
+}
+
+// 优化的COPY实现
+func (bcm *BulkCopyManager) processBatch(
+    ctx context.Context,
+    tableName string,
+    columns []string,
+    batch [][]interface{},
+) error {
+    tx, err := bcm.db.BeginTx(ctx, &sql.TxOptions{
+        Isolation: sql.LevelReadCommitted,
+    })
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback()
+    
+    // 使用COPY FROM STDIN
+    copySQL := fmt.Sprintf("COPY %s (%s) FROM STDIN WITH (FORMAT CSV)",
+        tableName, strings.Join(columns, ", "))
+    
+    stmt, err := tx.PrepareContext(ctx, copySQL)
+    if err != nil {
+        return err
+    }
+    defer stmt.Close()
+    
+    // 构建CSV数据
+    var buf bytes.Buffer
+    writer := csv.NewWriter(&buf)
+    
+    for _, row := range batch {
+        record := make([]string, len(row))
+        for i, val := range row {
+            record[i] = fmt.Sprintf("%v", val)
+        }
+        if err := writer.Write(record); err != nil {
+            return err
+        }
+    }
+    writer.Flush()
+    
+    // 执行COPY
+    if _, err := stmt.ExecContext(ctx, buf.String()); err != nil {
+        return err
+    }
+    
+    return tx.Commit()
+}
+```
+
+## 十一、高并发分布式架构设计
+
+### 1. 读写分离架构
+
+#### 主从复制感知连接池
+```go
+// 读写分离连接管理器
+type ReadWriteSplitManager struct {
+    masterPool   *ConnectionPool
+    slavePool    *ConnectionPool
+    readPolicy   ReadPolicy
+    healthCheck  *HealthChecker
+    
+    // 故障转移
+    failover     *FailoverManager
+    
+    // 监控
+    metrics      *Metrics
+}
+
+type ReadPolicy int
+
+const (
+    ReadFromSlave ReadPolicy = iota
+    ReadFromMaster
+    ReadFromBoth
+)
+
+// 智能路由实现
+func (rw *ReadWriteSplitManager) Query(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+    // 分析查询类型
+    queryType := rw.analyzeQuery(query)
+    
+    switch queryType {
+    case QueryTypeRead:
+        return rw.executeRead(ctx, query, args...)
+    case QueryTypeWrite:
+        return rw.executeWrite(ctx, query, args...)
+    case QueryTypeTransaction:
+        return rw.executeInTransaction(ctx, query, args...)
+    default:
+        return rw.executeWrite(ctx, query, args...) // 默认走主库
+    }
+}
+
+// 读操作路由
+func (rw *ReadWriteSplitManager) executeRead(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+    switch rw.readPolicy {
+    case ReadFromSlave:
+        if rw.healthCheck.IsSlaveHealthy() {
+            rows, err := rw.slavePool.Query(ctx, query, args...)
+            if err == nil {
+                rw.metrics.RecordSlaveRead()
+                return rows, nil
+            }
+            // 从库失败，降级到主库
+            rw.metrics.RecordSlaveFallback()
+        }
+        fallthrough
+    case ReadFromMaster:
+        rows, err := rw.masterPool.Query(ctx, query, args...)
+        if err == nil {
+            rw.metrics.RecordMasterRead()
+        }
+        return rows, err
+    case ReadFromBoth:
+        return rw.executeReadWithLoadBalance(ctx, query, args...)
+    }
+    
+    return nil, fmt.Errorf("unsupported read policy")
+}
+
+// 负载均衡读取
+func (rw *ReadWriteSplitManager) executeReadWithLoadBalance(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+    // 基于延迟的负载均衡
+    masterLatency := rw.healthCheck.GetMasterLatency()
+    slaveLatency := rw.healthCheck.GetSlaveLatency()
+    
+    // 选择延迟较低的实例
+    if slaveLatency < masterLatency && rw.healthCheck.IsSlaveHealthy() {
+        rows, err := rw.slavePool.Query(ctx, query, args...)
+        if err == nil {
+            rw.metrics.RecordSlaveRead()
+            return rows, nil
+        }
+    }
+    
+    rows, err := rw.masterPool.Query(ctx, query, args...)
+    if err == nil {
+        rw.metrics.RecordMasterRead()
+    }
+    return rows, err
+}
+```
+
+#### 分布式事务管理
+```go
+// 分布式事务协调器
+type DistributedTransactionCoordinator struct {
+    participants map[string]*sql.DB
+    timeout      time.Duration
+    logger       *log.Logger
+}
+
+// 两阶段提交实现
+func (dtc *DistributedTransactionCoordinator) ExecuteDistributedTransaction(
+    ctx context.Context,
+    operations map[string]func(*sql.Tx) error,
+) error {
+    // 第一阶段：准备
+    prepared := make(map[string]*sql.Tx)
+    defer func() {
+        // 清理未提交的事务
+        for name, tx := range prepared {
+            if tx != nil {
+                tx.Rollback()
+                dtc.logger.Printf("Rolled back transaction for %s", name)
+            }
+        }
+    }()
+    
+    // 准备所有参与者
+    for name, operation := range operations {
+        db, exists := dtc.participants[name]
+        if !exists {
+            return fmt.Errorf("participant %s not found", name)
+        }
+        
+        tx, err := db.BeginTx(ctx, &sql.TxOptions{
+            Isolation: sql.LevelSerializable,
+        })
+        if err != nil {
+            return fmt.Errorf("failed to begin transaction for %s: %w", name, err)
+        }
+        
+        // 执行操作
+        if err := operation(tx); err != nil {
+            tx.Rollback()
+            return fmt.Errorf("operation failed for %s: %w", name, err)
+        }
+        
+        // 准备提交（PostgreSQL中使用PREPARE TRANSACTION）
+        prepareSQL := fmt.Sprintf("PREPARE TRANSACTION '%s_%d'", name, time.Now().Unix())
+        if _, err := tx.Exec(prepareSQL); err != nil {
+            tx.Rollback()
+            return fmt.Errorf("prepare failed for %s: %w", name, err)
+        }
+        
+        prepared[name] = tx
+    }
+    
+    // 第二阶段：提交
+    for name, tx := range prepared {
+        if err := tx.Commit(); err != nil {
+            // 提交失败，需要回滚所有已准备的事务
+            dtc.rollbackPreparedTransactions(prepared)
+            return fmt.Errorf("commit failed for %s: %w", name, err)
+        }
+        prepared[name] = nil // 标记为已提交
+    }
+    
+    return nil
+}
+
+// 回滚已准备的事务
+func (dtc *DistributedTransactionCoordinator) rollbackPreparedTransactions(prepared map[string]*sql.Tx) {
+    for name, tx := range prepared {
+        if tx != nil {
+            rollbackSQL := fmt.Sprintf("ROLLBACK PREPARED '%s_%d'", name, time.Now().Unix())
+            if _, err := tx.Exec(rollbackSQL); err != nil {
+                dtc.logger.Printf("Failed to rollback prepared transaction for %s: %v", name, err)
+            }
+        }
+    }
+}
+```
+
+### 2. 分库分表架构
+
+#### 分片路由实现
+```go
+// 分片管理器
+type ShardingManager struct {
+    shards       map[string]*sql.DB
+    shardingRule ShardingRule
+    router       *ShardRouter
+}
+
+type ShardingRule interface {
+    GetShardKey(tableName string, data map[string]interface{}) (string, error)
+    GetShardName(shardKey string) string
+    GetAllShards() []string
+}
+
+// 哈希分片规则
+type HashShardingRule struct {
+    shardCount int
+    shardField string
+}
+
+func (h *HashShardingRule) GetShardKey(tableName string, data map[string]interface{}) (string, error) {
+    value, exists := data[h.shardField]
+    if !exists {
+        return "", fmt.Errorf("shard field %s not found", h.shardField)
+    }
+    
+    // 计算哈希值
+    hash := fnv.New32a()
+    hash.Write([]byte(fmt.Sprintf("%v", value)))
+    shardIndex := hash.Sum32() % uint32(h.shardCount)
+    
+    return fmt.Sprintf("shard_%d", shardIndex), nil
+}
+
+// 分片查询执行器
+func (sm *ShardingManager) ExecuteShardedQuery(
+    ctx context.Context,
+    query string,
+    shardKey string,
+    args ...interface{},
+) (*sql.Rows, error) {
+    shardName := sm.shardingRule.GetShardName(shardKey)
+    shard, exists := sm.shards[shardName]
+    if !exists {
+        return nil, fmt.Errorf("shard %s not found", shardName)
+    }
+    
+    return shard.QueryContext(ctx, query, args...)
+}
+
+// 跨分片聚合查询
+func (sm *ShardingManager) ExecuteAggregateQuery(
+    ctx context.Context,
+    query string,
+    aggregateFunc func([]*sql.Rows) (*sql.Rows, error),
+    args ...interface{},
+) (*sql.Rows, error) {
+    shards := sm.shardingRule.GetAllShards()
+    results := make([]*sql.Rows, 0, len(shards))
+    
+    // 并行查询所有分片
+    var wg sync.WaitGroup
+    resultCh := make(chan *sql.Rows, len(shards))
+    errCh := make(chan error, len(shards))
+    
+    for _, shardName := range shards {
+        wg.Add(1)
+        go func(shard string) {
+            defer wg.Done()
+            
+            db := sm.shards[shard]
+            rows, err := db.QueryContext(ctx, query, args...)
+            if err != nil {
+                errCh <- err
+                return
+            }
+            
+            resultCh <- rows
+        }(shardName)
+    }
+    
+    wg.Wait()
+    close(resultCh)
+    close(errCh)
+    
+    // 检查错误
+    for err := range errCh {
+        if err != nil {
+            return nil, err
+        }
+    }
+    
+    // 收集结果
+    for rows := range resultCh {
+        results = append(results, rows)
+    }
+    
+    // 聚合结果
+    return aggregateFunc(results)
+}
+```
+
+### 3. 缓存架构设计
+
+#### 多级缓存实现
+```go
+// 多级缓存管理器
+type MultiLevelCacheManager struct {
+    l1Cache    *sync.Map          // 本地缓存
+    l2Cache    *redis.Client      // Redis缓存
+    db         *sql.DB            // 数据库
+    
+    l1TTL      time.Duration
+    l2TTL      time.Duration
+    
+    // 缓存策略
+    strategy   CacheStrategy
+    
+    // 监控
+    metrics    *CacheMetrics
+}
+
+type CacheStrategy int
+
+const (
+    CacheAside CacheStrategy = iota
+    WriteThrough
+    WriteBack
+    WriteAround
+)
+
+// 智能缓存查询
+func (cm *MultiLevelCacheManager) Get(ctx context.Context, key string) (interface{}, error) {
+    // L1缓存查询
+    if value, ok := cm.l1Cache.Load(key); ok {
+        cm.metrics.RecordL1Hit()
+        return value, nil
+    }
+    cm.metrics.RecordL1Miss()
+    
+    // L2缓存查询
+    value, err := cm.l2Cache.Get(ctx, key).Result()
+    if err == nil {
+        // 回填L1缓存
+        cm.l1Cache.Store(key, value)
+        go cm.scheduleL1Eviction(key)
+        
+        cm.metrics.RecordL2Hit()
+        return value, nil
+    }
+    if err != redis.Nil {
+        return nil, err
+    }
+    cm.metrics.RecordL2Miss()
+    
+    // 数据库查询
+    dbValue, err := cm.queryDatabase(ctx, key)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 回填缓存
+    go cm.backfillCache(ctx, key, dbValue)
+    
+    cm.metrics.RecordDBHit()
+    return dbValue, nil
+}
+
+// 缓存更新策略
+func (cm *MultiLevelCacheManager) Set(ctx context.Context, key string, value interface{}) error {
+    switch cm.strategy {
+    case CacheAside:
+        return cm.setCacheAside(ctx, key, value)
+    case WriteThrough:
+        return cm.setWriteThrough(ctx, key, value)
+    case WriteBack:
+        return cm.setWriteBack(ctx, key, value)
+    case WriteAround:
+        return cm.setWriteAround(ctx, key, value)
+    default:
+        return fmt.Errorf("unsupported cache strategy")
+    }
+}
+
+// Cache-Aside模式
+func (cm *MultiLevelCacheManager) setCacheAside(ctx context.Context, key string, value interface{}) error {
+    // 先更新数据库
+    if err := cm.updateDatabase(ctx, key, value); err != nil {
+        return err
+    }
+    
+    // 删除缓存，让下次查询时重新加载
+    cm.l1Cache.Delete(key)
+    cm.l2Cache.Del(ctx, key)
+    
+    return nil
+}
+
+// Write-Through模式
+func (cm *MultiLevelCacheManager) setWriteThrough(ctx context.Context, key string, value interface{}) error {
+    // 同时更新数据库和缓存
+    if err := cm.updateDatabase(ctx, key, value); err != nil {
+        return err
+    }
+    
+    // 更新缓存
+    cm.l1Cache.Store(key, value)
+    go cm.scheduleL1Eviction(key)
+    
+    return cm.l2Cache.Set(ctx, key, value, cm.l2TTL).Err()
+}
+```
+
+## 十二、高频面试题深度解析
+
+### 1. 架构设计类
+
+#### Q1: 设计一个支持千万级用户的社交应用数据库架构
+
+**答案要点：**
+
+```go
+// 用户表分片策略
+type UserShardingStrategy struct {
+    shardCount int
+}
+
+func (u *UserShardingStrategy) GetUserShard(userID int64) string {
+    // 基于用户ID的一致性哈希
+    shardIndex := userID % int64(u.shardCount)
+    return fmt.Sprintf("user_shard_%d", shardIndex)
+}
+
+// 社交关系表设计
+type SocialRelationManager struct {
+    userShards     map[string]*sql.DB
+    relationShards map[string]*sql.DB
+    cacheManager   *MultiLevelCacheManager
+}
+
+// 关注关系查询优化
+func (srm *SocialRelationManager) GetFollowers(
+    ctx context.Context,
+    userID int64,
+    limit, offset int,
+) ([]int64, error) {
+    // 1. 尝试从缓存获取
+    cacheKey := fmt.Sprintf("followers:%d:%d:%d", userID, limit, offset)
+    if cached, err := srm.cacheManager.Get(ctx, cacheKey); err == nil {
+        return cached.([]int64), nil
+    }
+    
+    // 2. 数据库查询
+    shard := srm.getRelationShard(userID)
+    query := `
+        SELECT follower_id 
+        FROM user_relations 
+        WHERE followed_id = $1 AND status = 'active'
+        ORDER BY created_at DESC 
+        LIMIT $2 OFFSET $3
+    `
+    
+    rows, err := shard.QueryContext(ctx, query, userID, limit, offset)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    
+    var followers []int64
+    for rows.Next() {
+        var followerID int64
+        if err := rows.Scan(&followerID); err != nil {
+            return nil, err
+        }
+        followers = append(followers, followerID)
+    }
+    
+    // 3. 异步更新缓存
+    go srm.cacheManager.Set(ctx, cacheKey, followers)
+    
+    return followers, nil
+}
+
+// 热点用户处理
+func (srm *SocialRelationManager) HandleHotUser(userID int64) {
+    // 1. 识别热点用户
+    if srm.isHotUser(userID) {
+        // 2. 预加载到缓存
+        go srm.preloadUserData(userID)
+        
+        // 3. 使用读写分离
+        go srm.setupReadReplicas(userID)
+        
+        // 4. 异步处理关注关系变更
+        go srm.asyncProcessFollowChanges(userID)
+    }
+}
+```
+
+#### Q2: 如何处理数据库连接池在高并发下的性能问题？
+
+**答案要点：**
+
+```go
+// 自适应连接池
+type AdaptiveConnectionPool struct {
+    minConnections    int
+    maxConnections    int
+    currentConnections int
+    
+    // 性能监控
+    avgResponseTime   time.Duration
+    queueWaitTime     time.Duration
+    connectionUtilization float64
+    
+    // 自适应参数
+    scaleUpThreshold   float64
+    scaleDownThreshold float64
+    
+    mu sync.RWMutex
+}
+
+// 动态调整连接池大小
+func (acp *AdaptiveConnectionPool) AutoScale() {
+    acp.mu.Lock()
+    defer acp.mu.Unlock()
+    
+    utilization := acp.connectionUtilization
+    avgWait := acp.queueWaitTime
+    
+    // 扩容条件
+    if utilization > acp.scaleUpThreshold && avgWait > 10*time.Millisecond {
+        newSize := int(float64(acp.currentConnections) * 1.5)
+        if newSize <= acp.maxConnections {
+            acp.scaleUp(newSize)
+        }
+    }
+    
+    // 缩容条件
+    if utilization < acp.scaleDownThreshold && avgWait < 1*time.Millisecond {
+        newSize := int(float64(acp.currentConnections) * 0.8)
+        if newSize >= acp.minConnections {
+            acp.scaleDown(newSize)
+        }
+    }
+}
+
+// 连接预热策略
+func (acp *AdaptiveConnectionPool) WarmUpConnections(ctx context.Context) error {
+    // 预创建最小连接数
+    for i := 0; i < acp.minConnections; i++ {
+        conn, err := acp.createConnection(ctx)
+        if err != nil {
+            return err
+        }
+        
+        // 执行预热查询
+        if err := acp.warmUpConnection(conn); err != nil {
+            conn.Close()
+            continue
+        }
+        
+        acp.addToPool(conn)
+    }
+    
+    return nil
+}
+
+// 连接健康检查
+func (acp *AdaptiveConnectionPool) HealthCheck() {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+    
+    for range ticker.C {
+        acp.checkConnectionHealth()
+    }
+}
+
+func (acp *AdaptiveConnectionPool) checkConnectionHealth() {
+    acp.mu.Lock()
+    defer acp.mu.Unlock()
+    
+    for _, conn := range acp.connections {
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        
+        if err := conn.PingContext(ctx); err != nil {
+            // 连接不健康，移除并创建新连接
+            acp.removeConnection(conn)
+            go acp.createReplacementConnection()
+        }
+        
+        cancel()
+    }
+}
+```
+
+### 2. 性能优化类
+
+#### Q3: 如何优化大表的分页查询性能？
+
+**答案要点：**
+
+```go
+// 游标分页实现
+type CursorPagination struct {
+    db        *sql.DB
+    pageSize  int
+    indexCol  string
+}
+
+// 基于游标的分页查询
+func (cp *CursorPagination) GetPage(
+    ctx context.Context,
+    tableName string,
+    cursor string,
+    filters map[string]interface{},
+) (*PageResult, error) {
+    var whereClause strings.Builder
+    var args []interface{}
+    argIndex := 1
+    
+    // 构建WHERE条件
+    if cursor != "" {
+        whereClause.WriteString(fmt.Sprintf("%s > $%d", cp.indexCol, argIndex))
+        args = append(args, cursor)
+        argIndex++
+    }
+    
+    // 添加过滤条件
+    for col, val := range filters {
+        if whereClause.Len() > 0 {
+            whereClause.WriteString(" AND ")
+        }
+        whereClause.WriteString(fmt.Sprintf("%s = $%d", col, argIndex))
+        args = append(args, val)
+        argIndex++
+    }
+    
+    // 构建查询
+    query := fmt.Sprintf(`
+        SELECT * FROM %s 
+        WHERE %s 
+        ORDER BY %s 
+        LIMIT $%d
+    `, tableName, whereClause.String(), cp.indexCol, argIndex)
+    args = append(args, cp.pageSize+1) // +1用于判断是否有下一页
+    
+    rows, err := cp.db.QueryContext(ctx, query, args...)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    
+    var results []map[string]interface{}
+    for rows.Next() {
+        // 扫描结果...
+    }
+    
+    hasNext := len(results) > cp.pageSize
+    if hasNext {
+        results = results[:cp.pageSize]
+    }
+    
+    var nextCursor string
+    if hasNext && len(results) > 0 {
+        lastRow := results[len(results)-1]
+        nextCursor = fmt.Sprintf("%v", lastRow[cp.indexCol])
+    }
+    
+    return &PageResult{
+        Data:       results,
+        NextCursor: nextCursor,
+        HasNext:    hasNext,
+    }, nil
+}
+
+// 并行分页查询
+func (cp *CursorPagination) GetPageParallel(
+    ctx context.Context,
+    tableName string,
+    partitionCount int,
+) (*PageResult, error) {
+    // 获取分区边界
+    boundaries, err := cp.getPartitionBoundaries(ctx, tableName, partitionCount)
+    if err != nil {
+        return nil, err
+    }
+    
+    var wg sync.WaitGroup
+    resultCh := make(chan *PageResult, partitionCount)
+    errCh := make(chan error, partitionCount)
+    
+    // 并行查询各分区
+    for i := 0; i < partitionCount; i++ {
+        wg.Add(1)
+        go func(partitionIndex int) {
+            defer wg.Done()
+            
+            var startBoundary, endBoundary string
+            if partitionIndex > 0 {
+                startBoundary = boundaries[partitionIndex-1]
+            }
+            if partitionIndex < len(boundaries) {
+                endBoundary = boundaries[partitionIndex]
+            }
+            
+            result, err := cp.queryPartition(ctx, tableName, startBoundary, endBoundary)
+            if err != nil {
+                errCh <- err
+                return
+            }
+            
+            resultCh <- result
+        }(i)
+    }
+    
+    wg.Wait()
+    close(resultCh)
+    close(errCh)
+    
+    // 检查错误
+    for err := range errCh {
+        if err != nil {
+            return nil, err
+        }
+    }
+    
+    // 合并结果
+    return cp.mergeResults(resultCh), nil
+}
+```
+
+#### Q4: 如何实现数据库的读写分离和故障转移？
+
+**答案要点：**
+
+```go
+// 故障转移管理器
+type FailoverManager struct {
+    master          *sql.DB
+    slaves          []*sql.DB
+    currentMaster   int
+    healthChecker   *HealthChecker
+    
+    // 故障检测
+    failureThreshold int
+    checkInterval    time.Duration
+    
+    // 状态管理
+    masterStatus    NodeStatus
+    slaveStatus     []NodeStatus
+    
+    mu sync.RWMutex
+}
+
+type NodeStatus int
+
+const (
+    NodeHealthy NodeStatus = iota
+    NodeDegraded
+    NodeFailed
+)
+
+// 自动故障转移
+func (fm *FailoverManager) StartFailoverMonitoring(ctx context.Context) {
+    ticker := time.NewTicker(fm.checkInterval)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            fm.checkAndFailover(ctx)
+        }
+    }
+}
+
+func (fm *FailoverManager) checkAndFailover(ctx context.Context) {
+    fm.mu.Lock()
+    defer fm.mu.Unlock()
+    
+    // 检查主库状态
+    if !fm.healthChecker.CheckMaster(ctx) {
+        fm.masterStatus = NodeFailed
+        
+        // 选择新的主库
+        newMasterIndex := fm.selectNewMaster(ctx)
+        if newMasterIndex >= 0 {
+            fm.promoteToMaster(newMasterIndex)
+        }
+    } else {
+        fm.masterStatus = NodeHealthy
+    }
+    
+    // 检查从库状态
+    for i, slave := range fm.slaves {
+        if fm.healthChecker.CheckSlave(ctx, slave) {
+            fm.slaveStatus[i] = NodeHealthy
+        } else {
+            fm.slaveStatus[i] = NodeFailed
+        }
+    }
+}
+
+// 选择新主库的策略
+func (fm *FailoverManager) selectNewMaster(ctx context.Context) int {
+    bestCandidate := -1
+    bestScore := -1
+    
+    for i, slave := range fm.slaves {
+        if fm.slaveStatus[i] != NodeHealthy {
+            continue
+        }
+        
+        // 评估候选者
+        score := fm.evaluateCandidate(ctx, slave)
+        if score > bestScore {
+            bestScore = score
+            bestCandidate = i
+        }
+    }
+    
+    return bestCandidate
+}
+
+// 候选者评估（基于复制延迟、连接数等）
+func (fm *FailoverManager) evaluateCandidate(ctx context.Context, slave *sql.DB) int {
+    score := 100
+    
+    // 检查复制延迟
+    lag := fm.healthChecker.GetReplicationLag(ctx, slave)
+    if lag > 5*time.Second {
+        score -= 30
+    } else if lag > 1*time.Second {
+        score -= 10
+    }
+    
+    // 检查连接数
+    connections := fm.healthChecker.GetConnectionCount(ctx, slave)
+    if connections > 80 {
+        score -= 20
+    }
+    
+    // 检查负载
+    load := fm.healthChecker.GetCPULoad(ctx, slave)
+    if load > 0.8 {
+        score -= 15
+    }
+    
+    return score
+}
+
+// 提升从库为主库
+func (fm *FailoverManager) promoteToMaster(slaveIndex int) {
+    // 1. 停止向旧主库写入
+    fm.master.Close()
+    
+    // 2. 提升从库
+    newMaster := fm.slaves[slaveIndex]
+    fm.master = newMaster
+    
+    // 3. 从从库列表中移除
+    fm.slaves = append(fm.slaves[:slaveIndex], fm.slaves[slaveIndex+1:]...)
+    fm.slaveStatus = append(fm.slaveStatus[:slaveIndex], fm.slaveStatus[slaveIndex+1:]...)
+    
+    // 4. 通知应用层
+    fm.notifyFailover(slaveIndex)
+    
+    log.Printf("Failover completed: promoted slave %d to master", slaveIndex)
+}
+```
+
+### 3. 故障处理类
+
+#### Q5: 如何处理PostgreSQL的死锁问题？
+
+**答案要点：**
+
+```go
+// 死锁检测和处理
+type DeadlockHandler struct {
+    db              *sql.DB
+    maxRetries      int
+    baseDelay       time.Duration
+    maxDelay        time.Duration
+    jitterFactor    float64
+}
+
+// 智能重试机制
+func (dh *DeadlockHandler) ExecuteWithDeadlockRetry(
+    ctx context.Context,
+    operation func(*sql.Tx) error,
+) error {
+    for attempt := 0; attempt < dh.maxRetries; attempt++ {
+        tx, err := dh.db.BeginTx(ctx, &sql.TxOptions{
+            Isolation: sql.LevelReadCommitted,
+        })
+        if err != nil {
+            return err
+        }
+        
+        err = operation(tx)
+        if err != nil {
+            tx.Rollback()
+            
+            // 检查是否为死锁错误
+            if dh.isDeadlockError(err) {
+                delay := dh.calculateBackoffDelay(attempt)
+                
+                select {
+                case <-ctx.Done():
+                    return ctx.Err()
+                case <-time.After(delay):
+                    continue // 重试
+                }
+            }
+            
+            return err
+        }
+        
+        if err := tx.Commit(); err != nil {
+            if dh.isDeadlockError(err) {
+                delay := dh.calculateBackoffDelay(attempt)
+                select {
+                case <-ctx.Done():
+                    return ctx.Err()
+                case <-time.After(delay):
+                    continue
+                }
+            }
+            return err
+        }
+        
+        return nil // 成功
+    }
+    
+    return fmt.Errorf("operation failed after %d attempts due to deadlocks", dh.maxRetries)
+}
+
+// 死锁预防策略
+func (dh *DeadlockHandler) ExecuteWithLockOrdering(
+    ctx context.Context,
+    resources []string,
+    operation func(*sql.Tx, []string) error,
+) error {
+    // 对资源进行排序，确保一致的加锁顺序
+    sort.Strings(resources)
+    
+    return dh.ExecuteWithDeadlockRetry(ctx, func(tx *sql.Tx) error {
+        // 按顺序获取锁
+        for _, resource := range resources {
+            lockSQL := "SELECT pg_advisory_xact_lock(hashtext($1))"
+            if _, err := tx.ExecContext(ctx, lockSQL, resource); err != nil {
+                return err
+            }
+        }
+        
+        return operation(tx, resources)
+    })
+}
+
+// 死锁监控
+func (dh *DeadlockHandler) MonitorDeadlocks(ctx context.Context) {
+    ticker := time.NewTicker(1 * time.Minute)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            dh.checkDeadlockStats(ctx)
+        }
+    }
+}
+
+func (dh *DeadlockHandler) checkDeadlockStats(ctx context.Context) {
+    query := `
+        SELECT 
+            schemaname,
+            tablename,
+            n_deadlocks
+        FROM pg_stat_user_tables 
+        WHERE n_deadlocks > 0
+        ORDER BY n_deadlocks DESC
+    `
+    
+    rows, err := dh.db.QueryContext(ctx, query)
+    if err != nil {
+        log.Printf("Failed to query deadlock stats: %v", err)
+        return
+    }
+    defer rows.Close()
+    
+    for rows.Next() {
+        var schema, table string
+        var deadlocks int64
+        
+        if err := rows.Scan(&schema, &table, &deadlocks); err != nil {
+            continue
+        }
+        
+        if deadlocks > 10 { // 阈值告警
+            log.Printf("High deadlock count detected: %s.%s has %d deadlocks", 
+                schema, table, deadlocks)
+        }
+    }
+}
+```
+
+这个文档提供了pq驱动的全面技术指南，涵盖了核心原理、组件、优缺点、使用场景、最佳实践、深度技术原理解析、高并发分布式架构设计，以及高频面试题深度解析。内容从基础使用到高级架构设计，适合不同层次的开发者学习和面试准备。

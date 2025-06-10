@@ -73,6 +73,592 @@ Kafka 的高可用性（High Availability, HA）通过副本机制、Leader 选�
 
 ---
 
+## 四、企业级高可用架构设计
+
+### 1. 多层级高可用架构
+
+#### 1.1 企业级集群架构
+```go
+// 企业级Kafka高可用集群管理器
+type EnterpriseKafkaCluster struct {
+    regions          map[string]*RegionCluster
+    globalController *GlobalController
+    disasterRecovery *DisasterRecoveryManager
+    monitor          *ClusterMonitor
+    config           *ClusterConfig
+}
+
+type RegionCluster struct {
+    Region           string
+    DataCenters      map[string]*DataCenterCluster
+    LoadBalancer     *RegionLoadBalancer
+    FailoverManager  *RegionFailoverManager
+    ReplicationManager *CrossDCReplicationManager
+}
+
+type DataCenterCluster struct {
+    DataCenter       string
+    Brokers          []*BrokerNode
+    ZooKeepers       []*ZooKeeperNode  // 传统模式
+    KRaftNodes       []*KRaftNode      // KRaft模式
+    NetworkTopology  *NetworkTopology
+    StorageManager   *StorageManager
+}
+
+// 智能故障检测与恢复
+type IntelligentFailureDetector struct {
+    healthCheckers   map[string]*HealthChecker
+    anomalyDetector  *AnomalyDetector
+    predictiveModel  *FailurePredictionModel
+    alertManager     *AlertManager
+}
+
+// 多维度健康检查
+func (ifd *IntelligentFailureDetector) PerformHealthCheck() *ClusterHealth {
+    health := &ClusterHealth{
+        Timestamp: time.Now(),
+        Status:    "HEALTHY",
+        Issues:    make([]HealthIssue, 0),
+    }
+    
+    // 1. Broker健康检查
+    brokerHealth := ifd.checkBrokerHealth()
+    health.BrokerHealth = brokerHealth
+    
+    // 2. 网络连通性检查
+    networkHealth := ifd.checkNetworkHealth()
+    health.NetworkHealth = networkHealth
+    
+    // 3. 存储健康检查
+    storageHealth := ifd.checkStorageHealth()
+    health.StorageHealth = storageHealth
+    
+    // 4. 性能指标检查
+    performanceHealth := ifd.checkPerformanceHealth()
+    health.PerformanceHealth = performanceHealth
+    
+    // 5. 预测性分析
+    predictions := ifd.predictiveModel.PredictFailures(health)
+    health.Predictions = predictions
+    
+    // 6. 综合评估
+    health.Status = ifd.evaluateOverallHealth(health)
+    
+    return health
+}
+
+// 自动故障恢复
+func (ifd *IntelligentFailureDetector) AutoRecover(issue *HealthIssue) error {
+    switch issue.Type {
+    case "BROKER_DOWN":
+        return ifd.handleBrokerFailure(issue)
+    case "NETWORK_PARTITION":
+        return ifd.handleNetworkPartition(issue)
+    case "STORAGE_FAILURE":
+        return ifd.handleStorageFailure(issue)
+    case "PERFORMANCE_DEGRADATION":
+        return ifd.handlePerformanceDegradation(issue)
+    default:
+        return fmt.Errorf("unknown issue type: %s", issue.Type)
+    }
+}
+
+func (ifd *IntelligentFailureDetector) handleBrokerFailure(issue *HealthIssue) error {
+    brokerID := issue.ResourceID
+    
+    // 1. 确认Broker确实失效
+    if !ifd.confirmBrokerFailure(brokerID) {
+        return nil
+    }
+    
+    // 2. 触发Leader选举
+    if err := ifd.triggerLeaderElection(brokerID); err != nil {
+        return err
+    }
+    
+    // 3. 重新分配分区
+    if err := ifd.reassignPartitions(brokerID); err != nil {
+        return err
+    }
+    
+    // 4. 启动替换Broker
+    if err := ifd.launchReplacementBroker(brokerID); err != nil {
+        return err
+    }
+    
+    // 5. 数据恢复
+    return ifd.recoverBrokerData(brokerID)
+}
+```
+
+#### 1.2 智能负载均衡与故障转移
+```go
+// 智能负载均衡器
+type IntelligentLoadBalancer struct {
+    strategy         LoadBalancingStrategy
+    healthMonitor    *HealthMonitor
+    trafficAnalyzer  *TrafficAnalyzer
+    routingTable     *DynamicRoutingTable
+    circuitBreaker   *CircuitBreaker
+}
+
+type LoadBalancingStrategy int
+
+const (
+    RoundRobinStrategy LoadBalancingStrategy = iota
+    WeightedRoundRobinStrategy
+    LeastConnectionsStrategy
+    LatencyBasedStrategy
+    CapacityBasedStrategy
+    GeographicStrategy
+)
+
+// 动态路由决策
+func (ilb *IntelligentLoadBalancer) RouteRequest(request *KafkaRequest) (*BrokerNode, error) {
+    // 1. 获取可用Broker列表
+    availableBrokers := ilb.getAvailableBrokers(request)
+    if len(availableBrokers) == 0 {
+        return nil, fmt.Errorf("no available brokers")
+    }
+    
+    // 2. 根据策略选择Broker
+    selectedBroker := ilb.selectBroker(availableBrokers, request)
+    
+    // 3. 检查熔断器状态
+    if ilb.circuitBreaker.IsOpen(selectedBroker.ID) {
+        // 选择备用Broker
+        selectedBroker = ilb.selectFallbackBroker(availableBrokers, selectedBroker)
+    }
+    
+    // 4. 更新路由统计
+    ilb.updateRoutingStats(selectedBroker, request)
+    
+    return selectedBroker, nil
+}
+
+// 基于延迟的智能路由
+func (ilb *IntelligentLoadBalancer) selectByLatency(brokers []*BrokerNode, request *KafkaRequest) *BrokerNode {
+    var bestBroker *BrokerNode
+    var minLatency time.Duration = time.Hour // 初始化为很大的值
+    
+    for _, broker := range brokers {
+        // 获取历史延迟数据
+        avgLatency := ilb.trafficAnalyzer.GetAverageLatency(broker.ID)
+        currentLoad := ilb.trafficAnalyzer.GetCurrentLoad(broker.ID)
+        
+        // 计算预期延迟（考虑当前负载）
+        expectedLatency := ilb.calculateExpectedLatency(avgLatency, currentLoad)
+        
+        if expectedLatency < minLatency {
+            minLatency = expectedLatency
+            bestBroker = broker
+        }
+    }
+    
+    return bestBroker
+}
+
+// 地理位置感知路由
+func (ilb *IntelligentLoadBalancer) selectByGeography(brokers []*BrokerNode, request *KafkaRequest) *BrokerNode {
+    clientLocation := ilb.getClientLocation(request.ClientIP)
+    
+    var bestBroker *BrokerNode
+    var minDistance float64 = math.MaxFloat64
+    
+    for _, broker := range brokers {
+        distance := ilb.calculateDistance(clientLocation, broker.Location)
+        networkLatency := ilb.estimateNetworkLatency(distance)
+        
+        // 综合考虑距离和Broker负载
+        score := ilb.calculateLocationScore(distance, networkLatency, broker.Load)
+        
+        if score < minDistance {
+            minDistance = score
+            bestBroker = broker
+        }
+    }
+    
+    return bestBroker
+}
+```
+
+### 2. 跨数据中心容灾架构
+
+#### 2.1 多活数据中心设计
+```go
+// 多活数据中心管理器
+type MultiActiveDataCenterManager struct {
+    dataCenters      map[string]*DataCenter
+    replicationMgr   *CrossDCReplicationManager
+    conflictResolver *ConflictResolver
+    consistencyMgr   *ConsistencyManager
+    trafficSplitter  *TrafficSplitter
+}
+
+type DataCenter struct {
+    ID               string
+    Region           string
+    Status           DataCenterStatus
+    KafkaCluster     *KafkaCluster
+    LocalTopics      []string
+    ReplicatedTopics []string
+    NetworkLatency   map[string]time.Duration // 到其他DC的延迟
+}
+
+type DataCenterStatus int
+
+const (
+    DCActive DataCenterStatus = iota
+    DCStandby
+    DCMaintenance
+    DCFailed
+)
+
+// 智能流量分割
+func (madcm *MultiActiveDataCenterManager) SplitTraffic(request *KafkaRequest) *DataCenter {
+    // 1. 获取可用数据中心
+    availableDCs := madcm.getAvailableDataCenters()
+    
+    // 2. 根据请求类型决策
+    switch request.Type {
+    case ProduceRequest:
+        return madcm.selectProducerDC(request, availableDCs)
+    case ConsumeRequest:
+        return madcm.selectConsumerDC(request, availableDCs)
+    case AdminRequest:
+        return madcm.selectAdminDC(request, availableDCs)
+    default:
+        return madcm.selectDefaultDC(availableDCs)
+    }
+}
+
+// 生产者数据中心选择策略
+func (madcm *MultiActiveDataCenterManager) selectProducerDC(request *KafkaRequest, dcs []*DataCenter) *DataCenter {
+    topic := request.Topic
+    
+    // 1. 检查Topic的主数据中心
+    primaryDC := madcm.getPrimaryDCForTopic(topic)
+    if primaryDC != nil && madcm.isDCHealthy(primaryDC) {
+        return primaryDC
+    }
+    
+    // 2. 选择最近的健康数据中心
+    clientLocation := madcm.getClientLocation(request.ClientIP)
+    return madcm.selectNearestHealthyDC(clientLocation, dcs)
+}
+
+// 跨DC数据同步
+type CrossDCReplicationManager struct {
+    replicationStreams map[string]*ReplicationStream
+    conflictDetector   *ConflictDetector
+    lagMonitor         *ReplicationLagMonitor
+    compressionMgr     *CompressionManager
+}
+
+type ReplicationStream struct {
+    SourceDC         string
+    TargetDC         string
+    Topics           []string
+    ReplicationMode  ReplicationMode
+    Latency          time.Duration
+    Throughput       float64
+    ErrorRate        float64
+}
+
+type ReplicationMode int
+
+const (
+    AsyncReplication ReplicationMode = iota
+    SyncReplication
+    HybridReplication
+)
+
+// 智能复制策略
+func (cdrm *CrossDCReplicationManager) OptimizeReplication() error {
+    for streamID, stream := range cdrm.replicationStreams {
+        // 1. 分析复制性能
+        performance := cdrm.analyzeStreamPerformance(stream)
+        
+        // 2. 动态调整复制模式
+        if performance.Latency > 100*time.Millisecond {
+            // 高延迟时切换到异步模式
+            stream.ReplicationMode = AsyncReplication
+        } else if performance.ErrorRate < 0.001 {
+            // 低错误率时可以使用同步模式
+            stream.ReplicationMode = SyncReplication
+        }
+        
+        // 3. 调整批次大小和压缩
+        if err := cdrm.optimizeBatchingAndCompression(stream); err != nil {
+            log.Printf("Failed to optimize stream %s: %v", streamID, err)
+        }
+    }
+    
+    return nil
+}
+
+// 冲突检测与解决
+func (cdrm *CrossDCReplicationManager) DetectAndResolveConflicts() error {
+    conflicts := cdrm.conflictDetector.DetectConflicts()
+    
+    for _, conflict := range conflicts {
+        resolution, err := cdrm.resolveConflict(conflict)
+        if err != nil {
+            log.Printf("Failed to resolve conflict %s: %v", conflict.ID, err)
+            continue
+        }
+        
+        // 应用冲突解决方案
+        if err := cdrm.applyResolution(conflict, resolution); err != nil {
+            log.Printf("Failed to apply resolution for conflict %s: %v", conflict.ID, err)
+        }
+    }
+    
+    return nil
+}
+```
+
+#### 2.2 灾难恢复自动化
+```go
+// 灾难恢复管理器
+type DisasterRecoveryManager struct {
+    recoveryPlans    map[string]*RecoveryPlan
+    backupManager    *BackupManager
+    restoreManager   *RestoreManager
+    testManager      *DRTestManager
+    orchestrator     *RecoveryOrchestrator
+}
+
+type RecoveryPlan struct {
+    ID               string
+    TriggerConditions []TriggerCondition
+    RecoverySteps    []RecoveryStep
+    RTO              time.Duration // Recovery Time Objective
+    RPO              time.Duration // Recovery Point Objective
+    Priority         int
+    Dependencies     []string
+}
+
+type TriggerCondition struct {
+    Type        ConditionType
+    Threshold   interface{}
+    Duration    time.Duration
+    Description string
+}
+
+type ConditionType int
+
+const (
+    DataCenterDown ConditionType = iota
+    NetworkPartition
+    HighLatency
+    DataCorruption
+    SecurityBreach
+)
+
+// 自动灾难检测
+func (drm *DisasterRecoveryManager) MonitorForDisasters() {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            drm.checkDisasterConditions()
+        }
+    }
+}
+
+func (drm *DisasterRecoveryManager) checkDisasterConditions() {
+    for planID, plan := range drm.recoveryPlans {
+        triggered := drm.evaluateTriggerConditions(plan.TriggerConditions)
+        
+        if triggered {
+            log.Printf("Disaster detected, triggering recovery plan: %s", planID)
+            go drm.executeRecoveryPlan(plan)
+        }
+    }
+}
+
+// 执行恢复计划
+func (drm *DisasterRecoveryManager) executeRecoveryPlan(plan *RecoveryPlan) error {
+    log.Printf("Executing recovery plan: %s", plan.ID)
+    
+    // 1. 验证恢复前置条件
+    if err := drm.validatePreConditions(plan); err != nil {
+        return fmt.Errorf("pre-conditions not met: %w", err)
+    }
+    
+    // 2. 按优先级执行恢复步骤
+    for _, step := range plan.RecoverySteps {
+        if err := drm.executeRecoveryStep(step); err != nil {
+            log.Printf("Recovery step failed: %s, error: %v", step.Name, err)
+            
+            // 根据步骤配置决定是否继续
+            if step.CriticalStep {
+                return err
+            }
+        }
+    }
+    
+    // 3. 验证恢复结果
+    if err := drm.validateRecoveryResult(plan); err != nil {
+        return fmt.Errorf("recovery validation failed: %w", err)
+    }
+    
+    log.Printf("Recovery plan %s completed successfully", plan.ID)
+    return nil
+}
+
+// 自动备份管理
+type BackupManager struct {
+    backupStrategies map[string]*BackupStrategy
+    storageProviders map[string]StorageProvider
+    encryptionMgr    *EncryptionManager
+    compressionMgr   *CompressionManager
+}
+
+type BackupStrategy struct {
+    Name             string
+    Schedule         string // Cron表达式
+    RetentionPolicy  RetentionPolicy
+    BackupType       BackupType
+    Compression      bool
+    Encryption       bool
+    StorageProvider  string
+}
+
+type BackupType int
+
+const (
+    FullBackup BackupType = iota
+    IncrementalBackup
+    DifferentialBackup
+    ContinuousBackup
+)
+
+// 智能备份调度
+func (bm *BackupManager) ScheduleIntelligentBackup() error {
+    // 1. 分析数据变化模式
+    changePattern := bm.analyzeDataChangePattern()
+    
+    // 2. 根据模式调整备份策略
+    for strategyName, strategy := range bm.backupStrategies {
+        optimizedStrategy := bm.optimizeBackupStrategy(strategy, changePattern)
+        bm.backupStrategies[strategyName] = optimizedStrategy
+    }
+    
+    // 3. 执行备份
+    return bm.executeScheduledBackups()
+}
+
+// 快速恢复机制
+func (drm *DisasterRecoveryManager) FastRestore(backupID string, targetDC string) error {
+    // 1. 并行恢复多个分区
+    partitions := drm.getPartitionsFromBackup(backupID)
+    
+    // 2. 创建恢复任务
+    tasks := make([]*RestoreTask, len(partitions))
+    for i, partition := range partitions {
+        tasks[i] = &RestoreTask{
+            PartitionID: partition.ID,
+            BackupID:    backupID,
+            TargetDC:    targetDC,
+            Priority:    partition.Priority,
+        }
+    }
+    
+    // 3. 并行执行恢复
+    return drm.executeParallelRestore(tasks)
+}
+```
+
+### 3. 高级监控与预警系统
+
+#### 3.1 智能监控系统
+```go
+// 智能监控系统
+type IntelligentMonitoringSystem struct {
+    metricsCollector *MetricsCollector
+    anomalyDetector  *AnomalyDetector
+    alertManager     *AlertManager
+    dashboardMgr     *DashboardManager
+    mlPredictor      *MLPredictor
+}
+
+// 多维度指标收集
+func (ims *IntelligentMonitoringSystem) CollectMetrics() *ClusterMetrics {
+    metrics := &ClusterMetrics{
+        Timestamp: time.Now(),
+    }
+    
+    // 1. 基础性能指标
+    metrics.Performance = ims.collectPerformanceMetrics()
+    
+    // 2. 可用性指标
+    metrics.Availability = ims.collectAvailabilityMetrics()
+    
+    // 3. 一致性指标
+    metrics.Consistency = ims.collectConsistencyMetrics()
+    
+    // 4. 安全指标
+    metrics.Security = ims.collectSecurityMetrics()
+    
+    // 5. 业务指标
+    metrics.Business = ims.collectBusinessMetrics()
+    
+    return metrics
+}
+
+// 异常检测与预测
+func (ims *IntelligentMonitoringSystem) DetectAnomalies(metrics *ClusterMetrics) []*Anomaly {
+    var anomalies []*Anomaly
+    
+    // 1. 统计异常检测
+    statisticalAnomalies := ims.anomalyDetector.DetectStatisticalAnomalies(metrics)
+    anomalies = append(anomalies, statisticalAnomalies...)
+    
+    // 2. 机器学习异常检测
+    mlAnomalies := ims.mlPredictor.DetectMLAnomalies(metrics)
+    anomalies = append(anomalies, mlAnomalies...)
+    
+    // 3. 规则基础异常检测
+    ruleBasedAnomalies := ims.detectRuleBasedAnomalies(metrics)
+    anomalies = append(anomalies, ruleBasedAnomalies...)
+    
+    return anomalies
+}
+
+// 预测性维护
+func (ims *IntelligentMonitoringSystem) PredictiveMaintenance() []*MaintenanceRecommendation {
+    var recommendations []*MaintenanceRecommendation
+    
+    // 1. 硬件故障预测
+    hardwareFailures := ims.mlPredictor.PredictHardwareFailures()
+    for _, failure := range hardwareFailures {
+        recommendations = append(recommendations, &MaintenanceRecommendation{
+            Type:        "HARDWARE_REPLACEMENT",
+            Priority:    failure.Severity,
+            Description: fmt.Sprintf("预测硬件故障: %s", failure.Component),
+            Timeline:    failure.PredictedTime,
+        })
+    }
+    
+    // 2. 性能退化预测
+    performanceDegradations := ims.mlPredictor.PredictPerformanceDegradation()
+    for _, degradation := range performanceDegradations {
+        recommendations = append(recommendations, &MaintenanceRecommendation{
+            Type:        "PERFORMANCE_TUNING",
+            Priority:    degradation.Impact,
+            Description: fmt.Sprintf("预测性能退化: %s", degradation.Metric),
+            Timeline:    degradation.PredictedTime,
+        })
+    }
+    
+    return recommendations
+}
+```
+
 ## 五、跨机架/数据中心容灾
 
 ### 1. 机架感知（Rack Awareness）

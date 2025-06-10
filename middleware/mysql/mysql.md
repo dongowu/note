@@ -55,3 +55,345 @@ graph TD
     H --> D --> A
 ```
 
+## 高级架构设计与生产实战
+
+### 分布式架构下的MySQL设计模式
+
+#### 1. 微服务数据库拆分策略
+**按业务域拆分（推荐）**：
+- 用户服务：user_db（用户基础信息、认证数据）
+- 订单服务：order_db（订单、支付、物流数据）
+- 商品服务：product_db（商品信息、库存、分类）
+- 营销服务：marketing_db（优惠券、活动、推荐）
+
+**Go实现数据库路由**：
+```go
+type DatabaseRouter struct {
+    userDB    *sql.DB
+    orderDB   *sql.DB
+    productDB *sql.DB
+}
+
+func (r *DatabaseRouter) GetDB(service string) *sql.DB {
+    switch service {
+    case "user":
+        return r.userDB
+    case "order":
+        return r.orderDB
+    case "product":
+        return r.productDB
+    default:
+        return nil
+    }
+}
+```
+
+#### 2. 分库分表架构设计
+**水平分片策略**：
+```go
+// 用户表按用户ID哈希分片
+func getUserShardDB(userID int64) string {
+    return fmt.Sprintf("user_db_%d", userID%8)
+}
+
+// 订单表按时间+用户ID复合分片
+func getOrderShardTable(userID int64, createTime time.Time) string {
+    month := createTime.Format("200601")
+    shard := userID % 16
+    return fmt.Sprintf("order_%s_%02d", month, shard)
+}
+```
+
+**跨分片查询解决方案**：
+```go
+type ShardingQuery struct {
+    shards []string
+    merger func([]interface{}) interface{}
+}
+
+func (sq *ShardingQuery) QueryAllShards(sql string, args ...interface{}) (interface{}, error) {
+    var results []interface{}
+    for _, shard := range sq.shards {
+        db := getShardDB(shard)
+        result, err := db.Query(sql, args...)
+        if err != nil {
+            return nil, err
+        }
+        results = append(results, result)
+    }
+    return sq.merger(results), nil
+}
+```
+
+### 高可用架构实践
+
+#### 1. 主从复制 + 读写分离
+**生产级配置**：
+```go
+type MySQLCluster struct {
+    master    *sql.DB
+    slaves    []*sql.DB
+    current   int32
+    health    map[string]bool
+    mutex     sync.RWMutex
+}
+
+func (c *MySQLCluster) GetReadDB() *sql.DB {
+    c.mutex.RLock()
+    defer c.mutex.RUnlock()
+    
+    // 轮询选择健康的从库
+    for i := 0; i < len(c.slaves); i++ {
+        idx := atomic.AddInt32(&c.current, 1) % int32(len(c.slaves))
+        if c.health[fmt.Sprintf("slave_%d", idx)] {
+            return c.slaves[idx]
+        }
+    }
+    // 所有从库不可用时降级到主库
+    return c.master
+}
+
+func (c *MySQLCluster) GetWriteDB() *sql.DB {
+    return c.master
+}
+```
+
+#### 2. 故障自动切换机制
+**基于Consul的服务发现**：
+```go
+type FailoverManager struct {
+    consul     *api.Client
+    masterKey  string
+    candidates []string
+}
+
+func (fm *FailoverManager) MonitorMaster() {
+    ticker := time.NewTicker(5 * time.Second)
+    for range ticker.C {
+        if !fm.checkMasterHealth() {
+            fm.promoteNewMaster()
+        }
+    }
+}
+
+func (fm *FailoverManager) promoteNewMaster() error {
+    // 1. 选择延迟最小的从库
+    newMaster := fm.selectBestSlave()
+    // 2. 更新Consul中的主库地址
+    return fm.consul.KV().Put(&api.KVPair{
+        Key:   fm.masterKey,
+        Value: []byte(newMaster),
+    }, nil)
+}
+```
+
+### 性能优化最佳实践
+
+#### 1. 连接池深度优化
+**智能连接池实现**：
+```go
+type SmartConnectionPool struct {
+    db          *sql.DB
+    maxOpen     int
+    maxIdle     int
+    maxLifetime time.Duration
+    metrics     *PoolMetrics
+}
+
+type PoolMetrics struct {
+    ActiveConns   int64
+    IdleConns     int64
+    WaitCount     int64
+    WaitDuration  time.Duration
+}
+
+func (p *SmartConnectionPool) AutoTune() {
+    stats := p.db.Stats()
+    
+    // 根据等待时间动态调整连接数
+    if stats.WaitDuration > 100*time.Millisecond {
+        newMax := int(float64(p.maxOpen) * 1.2)
+        if newMax <= 200 { // 设置上限
+            p.db.SetMaxOpenConns(newMax)
+            p.maxOpen = newMax
+        }
+    }
+    
+    // 根据空闲连接数调整
+    if stats.Idle > p.maxIdle*2 {
+        p.db.SetMaxIdleConns(p.maxIdle / 2)
+    }
+}
+```
+
+#### 2. 查询缓存策略
+**多级缓存架构**：
+```go
+type CacheLayer struct {
+    l1Cache *sync.Map          // 进程内缓存
+    l2Cache *redis.Client      // Redis缓存
+    l3Cache *sql.DB           // 数据库
+}
+
+func (c *CacheLayer) Get(key string) (interface{}, error) {
+    // L1缓存查询
+    if val, ok := c.l1Cache.Load(key); ok {
+        return val, nil
+    }
+    
+    // L2缓存查询
+    val, err := c.l2Cache.Get(context.Background(), key).Result()
+    if err == nil {
+        c.l1Cache.Store(key, val)
+        return val, nil
+    }
+    
+    // L3数据库查询
+    dbVal, err := c.queryFromDB(key)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 回写缓存
+    c.l2Cache.Set(context.Background(), key, dbVal, time.Hour)
+    c.l1Cache.Store(key, dbVal)
+    return dbVal, nil
+}
+```
+
+### 监控与运维体系
+
+#### 1. 全链路监控
+**关键指标监控**：
+```go
+type MySQLMonitor struct {
+    db       *sql.DB
+    metrics  *prometheus.Registry
+    logger   *zap.Logger
+}
+
+func (m *MySQLMonitor) CollectMetrics() {
+    stats := m.db.Stats()
+    
+    // 连接池指标
+    connectionGauge.Set(float64(stats.OpenConnections))
+    idleGauge.Set(float64(stats.Idle))
+    waitCountGauge.Set(float64(stats.WaitCount))
+    
+    // 慢查询监控
+    slowQueries := m.getSlowQueries()
+    for _, query := range slowQueries {
+        m.logger.Warn("Slow query detected", 
+            zap.String("sql", query.SQL),
+            zap.Duration("duration", query.Duration),
+        )
+    }
+}
+```
+
+#### 2. 自动化运维
+**数据库健康检查**：
+```go
+func (m *MySQLMonitor) HealthCheck() error {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    // 连接检查
+    if err := m.db.PingContext(ctx); err != nil {
+        return fmt.Errorf("ping failed: %w", err)
+    }
+    
+    // 主从延迟检查
+    var lag int
+    err := m.db.QueryRowContext(ctx, "SHOW SLAVE STATUS").Scan(&lag)
+    if err == nil && lag > 60 {
+        return fmt.Errorf("replication lag too high: %d seconds", lag)
+    }
+    
+    // 锁等待检查
+    var lockWaits int
+    m.db.QueryRowContext(ctx, 
+        "SELECT COUNT(*) FROM information_schema.innodb_lock_waits").Scan(&lockWaits)
+    if lockWaits > 10 {
+        return fmt.Errorf("too many lock waits: %d", lockWaits)
+    }
+    
+    return nil
+}
+```
+
+### 面试高频架构问题
+
+#### 1. 如何设计一个支持千万级用户的社交应用数据库架构？
+**解决方案**：
+- **用户分片**：按用户ID哈希分布到64个分片
+- **关系分片**：关注/粉丝关系按用户ID分片存储
+- **内容分片**：动态内容按时间+用户ID分片
+- **缓存策略**：热点用户数据Redis缓存，冷数据降级存储
+
+#### 2. 如何处理秒杀场景下的数据库压力？
+**技术方案**：
+```go
+// 库存预扣 + 异步确认模式
+type SeckillService struct {
+    cache    *redis.Client
+    queue    chan *Order
+    db       *sql.DB
+}
+
+func (s *SeckillService) Seckill(productID int64, userID int64) error {
+    // 1. Redis原子扣减库存
+    result := s.cache.Eval(context.Background(), `
+        local stock = redis.call('get', KEYS[1])
+        if tonumber(stock) > 0 then
+            redis.call('decr', KEYS[1])
+            return 1
+        else
+            return 0
+        end
+    `, []string{fmt.Sprintf("stock:%d", productID)}).Int()
+    
+    if result == 0 {
+        return errors.New("stock not enough")
+    }
+    
+    // 2. 异步写入订单
+    order := &Order{ProductID: productID, UserID: userID}
+    select {
+    case s.queue <- order:
+        return nil
+    default:
+        // 队列满时回滚库存
+        s.cache.Incr(context.Background(), fmt.Sprintf("stock:%d", productID))
+        return errors.New("system busy")
+    }
+}
+```
+
+#### 3. 如何保证分布式事务的一致性？
+**Saga模式实现**：
+```go
+type SagaTransaction struct {
+    steps []SagaStep
+    compensations []CompensationStep
+}
+
+type SagaStep interface {
+    Execute() error
+    Compensate() error
+}
+
+func (s *SagaTransaction) Execute() error {
+    for i, step := range s.steps {
+        if err := step.Execute(); err != nil {
+            // 执行补偿操作
+            for j := i - 1; j >= 0; j-- {
+                s.steps[j].Compensate()
+            }
+            return err
+        }
+    }
+    return nil
+}
+```
+

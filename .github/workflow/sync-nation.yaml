@@ -1,0 +1,45 @@
+name: Sync to Notion
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history for git diff
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v39
+        with:
+          files: |
+            **/*.md
+            **/*.py
+            **/*.js
+            **/*.ts
+            **/*.jsx
+            **/*.tsx
+
+      - name: Sync files to Notion
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            if [ -f "$file" ]; then
+              content=$(cat "$file" | base64 -w 0)
+              curl -X POST ${{ secrets.VERCEL_SYNC_URL }} \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"notion_token\": \"${{ secrets.NOTION_TOKEN }}\",
+                  \"github_token\": \"${{ secrets.GITHUB_TOKEN }}\",
+                  \"repo_name\": \"${{ github.repository }}\",
+                  \"file_path\": \"$file\",
+                  \"content\": \"$content\",
+                  \"file_pattern\": \"**/*.{md,py,js,ts,jsx,tsx}\"
+                }"
+            fi
+          done 

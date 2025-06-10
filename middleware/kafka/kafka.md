@@ -55,12 +55,700 @@ Apache Kafka 是一款基于发布-订阅模式的分布式流处理平台，设
 4. **Consumer设计**：避免长事务处理，使用`enable.auto.commit=true`（配合`auto.commit.interval.ms`）或手动提交（`commitSync()`）；
 5. **监控指标**：重点关注`RequestQueueSize`（Broker请求队列长度）、`UnderReplicatedPartitions`（未同步副本数）、`ConsumerLag`（消费延迟）。
 
-## 八、注意事项
-1. **消息顺序性**：仅保证单Partition内消息有序，跨Partition无法保证全局顺序；
-2. **重复与丢失**：`acks=0`可能丢消息，`acks=1`可能丢/重复，`acks=all`（配合`min.insync.replicas≥2`）可实现精确一次（Exactly Once）；
-3. **磁盘空间**：需监控`retention.ms`和日志增长速度，避免因空间不足导致消息被提前删除；
-4. **网络延迟**：跨机房部署时，副本同步可能增加延迟，建议采用多集群+MirrorMaker方案；
-5. **版本兼容性**：Producer/Consumer与Broker需保持版本兼容（如Kafka 2.0+支持新的协议API）。
+## 八、企业级架构设计与生产实战
+
+### 1. 大规模集群架构设计
+
+#### 1.1 多层级集群架构
+```go
+// 企业级Kafka集群管理器
+type EnterpriseKafkaManager struct {
+    clusters map[string]*KafkaCluster
+    monitor  *ClusterMonitor
+    balancer *LoadBalancer
+}
+
+type KafkaCluster struct {
+    Name        string
+    Environment string // dev/test/prod
+    Brokers     []*BrokerNode
+    Topics      map[string]*TopicConfig
+    Security    *SecurityConfig
+}
+
+type BrokerNode struct {
+    ID       int32
+    Host     string
+    Port     int
+    Rack     string
+    DataDirs []string
+    JVMConfig *JVMConfig
+}
+
+// 集群容量规划
+func (ekm *EnterpriseKafkaManager) PlanClusterCapacity(requirements *CapacityRequirements) *ClusterPlan {
+    plan := &ClusterPlan{}
+    
+    // 1. 计算所需分区数
+    totalPartitions := requirements.ExpectedThroughput / requirements.PartitionThroughput
+    
+    // 2. 计算Broker数量（考虑副本因子）
+    brokerCount := int(math.Ceil(float64(totalPartitions * requirements.ReplicationFactor) / float64(requirements.PartitionsPerBroker)))
+    
+    // 3. 存储容量规划
+    storagePerBroker := requirements.DailyDataVolume * requirements.RetentionDays / brokerCount
+    
+    plan.BrokerCount = brokerCount
+    plan.StoragePerBroker = storagePerBroker
+    plan.NetworkBandwidth = requirements.ExpectedThroughput * 1.5 // 50%冗余
+    
+    return plan
+}
+
+// 智能分区分配策略
+func (ekm *EnterpriseKafkaManager) OptimizePartitionAssignment(topic string) error {
+    cluster := ekm.clusters["prod"]
+    
+    // 1. 收集Broker负载信息
+    brokerLoads := ekm.collectBrokerLoads(cluster)
+    
+    // 2. 计算最优分配方案
+    assignment := ekm.calculateOptimalAssignment(brokerLoads)
+    
+    // 3. 执行分区重分配
+    return ekm.executeReassignment(topic, assignment)
+}
+
+func (ekm *EnterpriseKafkaManager) collectBrokerLoads(cluster *KafkaCluster) map[int32]*BrokerLoad {
+    loads := make(map[int32]*BrokerLoad)
+    
+    for _, broker := range cluster.Brokers {
+        load := &BrokerLoad{
+            BrokerID:        broker.ID,
+            CPUUsage:        ekm.monitor.GetCPUUsage(broker.ID),
+            MemoryUsage:     ekm.monitor.GetMemoryUsage(broker.ID),
+            DiskUsage:       ekm.monitor.GetDiskUsage(broker.ID),
+            NetworkIO:       ekm.monitor.GetNetworkIO(broker.ID),
+            PartitionCount:  ekm.monitor.GetPartitionCount(broker.ID),
+            LeaderCount:     ekm.monitor.GetLeaderCount(broker.ID),
+        }
+        loads[broker.ID] = load
+    }
+    
+    return loads
+}
+```
+
+#### 1.2 跨数据中心部署架构
+```go
+// 多数据中心Kafka架构
+type MultiDCKafkaArchitecture struct {
+    primaryDC   *DataCenter
+    secondaryDC *DataCenter
+    mirrorMaker *MirrorMakerConfig
+    confluentReplicator *ConfluentReplicatorConfig
+}
+
+type DataCenter struct {
+    Name     string
+    Region   string
+    Clusters []*KafkaCluster
+    Network  *NetworkConfig
+}
+
+// 跨DC数据同步策略
+func (mdc *MultiDCKafkaArchitecture) SetupCrossDCReplication() error {
+    // 1. 配置MirrorMaker 2.0
+    mm2Config := &MirrorMaker2Config{
+        SourceCluster: mdc.primaryDC.Clusters[0],
+        TargetCluster: mdc.secondaryDC.Clusters[0],
+        TopicWhitelist: []string{"critical-events", "user-activities"},
+        ReplicationFactor: 3,
+        SyncGroupOffsets: true,
+        EmitHeartbeats: true,
+    }
+    
+    // 2. 启动双向同步
+    if err := mdc.startBidirectionalReplication(mm2Config); err != nil {
+        return err
+    }
+    
+    // 3. 配置故障转移策略
+    return mdc.setupFailoverStrategy()
+}
+
+// 智能故障转移
+func (mdc *MultiDCKafkaArchitecture) HandleDCFailover(failedDC string) error {
+    log.Printf("Initiating failover from %s", failedDC)
+    
+    // 1. 停止向故障DC的写入
+    if err := mdc.redirectTrafficToHealthyDC(failedDC); err != nil {
+        return err
+    }
+    
+    // 2. 更新DNS记录
+    if err := mdc.updateDNSRecords(failedDC); err != nil {
+        return err
+    }
+    
+    // 3. 通知应用层切换
+    return mdc.notifyApplications(failedDC)
+}
+```
+
+### 2. 性能优化与调优
+
+#### 2.1 JVM调优策略
+```bash
+# 生产环境JVM配置
+# kafka-server-start.sh
+export KAFKA_HEAP_OPTS="-Xmx8g -Xms8g"
+export KAFKA_JVM_PERFORMANCE_OPTS="
+-server
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=20
+-XX:InitiatingHeapOccupancyPercent=35
+-XX:+ExplicitGCInvokesConcurrent
+-XX:MaxInlineLevel=15
+-Djava.awt.headless=true
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/opt/kafka/logs/
+-XX:+PrintGCDetails
+-XX:+PrintGCTimeStamps
+-XX:+PrintGCApplicationStoppedTime
+-XX:+UseGCLogFileRotation
+-XX:NumberOfGCLogFiles=10
+-XX:GCLogFileSize=100M
+"
+```
+
+#### 2.2 操作系统优化
+```bash
+# 内核参数优化
+# /etc/sysctl.conf
+vm.swappiness=1                    # 减少swap使用
+vm.dirty_background_ratio=5        # 后台刷盘比例
+vm.dirty_ratio=60                  # 强制刷盘比例
+net.core.wmem_default=131072       # 默认发送缓冲区
+net.core.rmem_default=131072       # 默认接收缓冲区
+net.core.wmem_max=2097152         # 最大发送缓冲区
+net.core.rmem_max=2097152         # 最大接收缓冲区
+net.ipv4.tcp_window_scaling=1      # TCP窗口扩展
+net.ipv4.tcp_rmem=4096 65536 2097152
+net.ipv4.tcp_wmem=4096 65536 2097152
+fs.file-max=100000                 # 最大文件句柄数
+
+# 磁盘调度器优化
+echo deadline > /sys/block/sda/queue/scheduler
+
+# 文件系统挂载优化
+# /etc/fstab
+/dev/sdb1 /data/kafka ext4 noatime,nodiratime 0 2
+```
+
+#### 2.3 高性能配置优化
+```go
+// 高性能Kafka配置生成器
+type PerformanceConfigGenerator struct {
+    workloadType    WorkloadType
+    hardwareSpec    *HardwareSpec
+    performanceGoal *PerformanceGoal
+}
+
+type WorkloadType int
+
+const (
+    HighThroughput WorkloadType = iota
+    LowLatency
+    Balanced
+)
+
+func (pcg *PerformanceConfigGenerator) GenerateBrokerConfig() map[string]interface{} {
+    config := make(map[string]interface{})
+    
+    switch pcg.workloadType {
+    case HighThroughput:
+        config["num.network.threads"] = pcg.hardwareSpec.CPUCores
+        config["num.io.threads"] = pcg.hardwareSpec.CPUCores * 2
+        config["socket.send.buffer.bytes"] = 102400
+        config["socket.receive.buffer.bytes"] = 102400
+        config["socket.request.max.bytes"] = 104857600
+        config["num.replica.fetchers"] = 4
+        config["replica.fetch.min.bytes"] = 1024
+        config["replica.fetch.wait.max.ms"] = 500
+        
+    case LowLatency:
+        config["num.network.threads"] = pcg.hardwareSpec.CPUCores * 2
+        config["num.io.threads"] = pcg.hardwareSpec.CPUCores
+        config["socket.send.buffer.bytes"] = 65536
+        config["socket.receive.buffer.bytes"] = 65536
+        config["replica.fetch.min.bytes"] = 1
+        config["replica.fetch.wait.max.ms"] = 10
+        
+    case Balanced:
+        config["num.network.threads"] = int(float64(pcg.hardwareSpec.CPUCores) * 1.5)
+        config["num.io.threads"] = pcg.hardwareSpec.CPUCores
+        config["socket.send.buffer.bytes"] = 81920
+        config["socket.receive.buffer.bytes"] = 81920
+        config["replica.fetch.min.bytes"] = 512
+        config["replica.fetch.wait.max.ms"] = 100
+    }
+    
+    // 通用优化配置
+    config["log.segment.bytes"] = 1073741824  // 1GB
+    config["log.retention.check.interval.ms"] = 300000  // 5分钟
+    config["log.cleaner.threads"] = 2
+    config["log.cleaner.dedupe.buffer.size"] = 134217728  // 128MB
+    config["compression.type"] = "lz4"
+    config["min.insync.replicas"] = 2
+    config["unclean.leader.election.enable"] = false
+    
+    return config
+}
+```
+
+### 3. 监控告警体系
+
+#### 3.1 全方位监控指标
+```go
+// Kafka监控指标收集器
+type KafkaMetricsCollector struct {
+    jmxClient    *JMXClient
+    promClient   *PrometheusClient
+    alertManager *AlertManager
+}
+
+// 核心性能指标
+type KafkaMetrics struct {
+    // Broker级别指标
+    BrokerMetrics struct {
+        RequestQueueSize        float64 `json:"request_queue_size"`
+        ResponseQueueSize       float64 `json:"response_queue_size"`
+        NetworkProcessorAvgIdle float64 `json:"network_processor_avg_idle"`
+        RequestHandlerAvgIdle   float64 `json:"request_handler_avg_idle"`
+        LogFlushRate           float64 `json:"log_flush_rate"`
+        LogFlushTime           float64 `json:"log_flush_time"`
+        UnderReplicatedPartitions int   `json:"under_replicated_partitions"`
+        OfflinePartitions      int     `json:"offline_partitions"`
+    }
+    
+    // Topic级别指标
+    TopicMetrics map[string]struct {
+        MessagesInPerSec  float64 `json:"messages_in_per_sec"`
+        BytesInPerSec     float64 `json:"bytes_in_per_sec"`
+        BytesOutPerSec    float64 `json:"bytes_out_per_sec"`
+        TotalProduceRequests float64 `json:"total_produce_requests"`
+        TotalFetchRequests   float64 `json:"total_fetch_requests"`
+        ProduceRequestRate   float64 `json:"produce_request_rate"`
+        FetchRequestRate     float64 `json:"fetch_request_rate"`
+    }
+    
+    // Consumer Group指标
+    ConsumerGroupMetrics map[string]struct {
+        Lag           int64   `json:"lag"`
+        LagSum        int64   `json:"lag_sum"`
+        Members       int     `json:"members"`
+        State         string  `json:"state"`
+        RebalanceRate float64 `json:"rebalance_rate"`
+    }
+}
+
+func (kmc *KafkaMetricsCollector) CollectMetrics() (*KafkaMetrics, error) {
+    metrics := &KafkaMetrics{}
+    
+    // 1. 收集Broker指标
+    brokerMetrics, err := kmc.collectBrokerMetrics()
+    if err != nil {
+        return nil, err
+    }
+    metrics.BrokerMetrics = *brokerMetrics
+    
+    // 2. 收集Topic指标
+    topicMetrics, err := kmc.collectTopicMetrics()
+    if err != nil {
+        return nil, err
+    }
+    metrics.TopicMetrics = topicMetrics
+    
+    // 3. 收集Consumer Group指标
+    consumerMetrics, err := kmc.collectConsumerGroupMetrics()
+    if err != nil {
+        return nil, err
+    }
+    metrics.ConsumerGroupMetrics = consumerMetrics
+    
+    return metrics, nil
+}
+
+// 智能告警规则引擎
+func (kmc *KafkaMetricsCollector) EvaluateAlerts(metrics *KafkaMetrics) []*Alert {
+    var alerts []*Alert
+    
+    // 1. Broker健康检查
+    if metrics.BrokerMetrics.UnderReplicatedPartitions > 0 {
+        alerts = append(alerts, &Alert{
+            Level:   "CRITICAL",
+            Message: fmt.Sprintf("发现%d个副本不足的分区", metrics.BrokerMetrics.UnderReplicatedPartitions),
+            Metric:  "under_replicated_partitions",
+            Value:   float64(metrics.BrokerMetrics.UnderReplicatedPartitions),
+        })
+    }
+    
+    if metrics.BrokerMetrics.RequestQueueSize > 100 {
+        alerts = append(alerts, &Alert{
+            Level:   "WARNING",
+            Message: "请求队列积压严重，可能影响性能",
+            Metric:  "request_queue_size",
+            Value:   metrics.BrokerMetrics.RequestQueueSize,
+        })
+    }
+    
+    // 2. Consumer Lag检查
+    for groupID, groupMetrics := range metrics.ConsumerGroupMetrics {
+        if groupMetrics.LagSum > 10000 {
+            alerts = append(alerts, &Alert{
+                Level:   "WARNING",
+                Message: fmt.Sprintf("消费者组%s积压消息过多: %d", groupID, groupMetrics.LagSum),
+                Metric:  "consumer_lag",
+                Value:   float64(groupMetrics.LagSum),
+                Tags:    map[string]string{"group_id": groupID},
+            })
+        }
+    }
+    
+    return alerts
+}
+```
+
+#### 3.2 自动化运维工具
+```go
+// Kafka自动化运维管理器
+type KafkaOpsManager struct {
+    clusters     map[string]*KafkaCluster
+    monitor      *KafkaMetricsCollector
+    autoScaler   *AutoScaler
+    backupManager *BackupManager
+}
+
+// 自动扩缩容
+func (kom *KafkaOpsManager) AutoScale(clusterName string) error {
+    cluster := kom.clusters[clusterName]
+    metrics, err := kom.monitor.CollectMetrics()
+    if err != nil {
+        return err
+    }
+    
+    // 1. 评估是否需要扩容
+    if kom.shouldScaleOut(metrics) {
+        return kom.scaleOutCluster(cluster)
+    }
+    
+    // 2. 评估是否可以缩容
+    if kom.shouldScaleIn(metrics) {
+        return kom.scaleInCluster(cluster)
+    }
+    
+    return nil
+}
+
+func (kom *KafkaOpsManager) shouldScaleOut(metrics *KafkaMetrics) bool {
+    // CPU使用率 > 80% 或 网络IO > 80% 或 磁盘使用率 > 85%
+    return metrics.BrokerMetrics.NetworkProcessorAvgIdle < 0.2 ||
+           metrics.BrokerMetrics.RequestHandlerAvgIdle < 0.2
+}
+
+// 自动化备份与恢复
+func (kom *KafkaOpsManager) ScheduleBackup(clusterName string) error {
+    cluster := kom.clusters[clusterName]
+    
+    // 1. 创建Topic配置备份
+    topicBackup := kom.backupManager.BackupTopicConfigs(cluster)
+    
+    // 2. 创建Consumer Group偏移量备份
+    offsetBackup := kom.backupManager.BackupConsumerOffsets(cluster)
+    
+    // 3. 存储到对象存储
+    return kom.backupManager.StoreBackup(topicBackup, offsetBackup)
+}
+```
+
+### 4. 安全与合规
+
+#### 4.1 企业级安全配置
+```go
+// Kafka安全管理器
+type KafkaSecurityManager struct {
+    sslConfig  *SSLConfig
+    saslConfig *SASLConfig
+    aclManager *ACLManager
+    auditLog   *AuditLogger
+}
+
+// SSL/TLS配置
+type SSLConfig struct {
+    KeystorePath     string
+    KeystorePassword string
+    TruststorePath   string
+    TruststorePassword string
+    KeyPassword      string
+    Protocol         string // TLSv1.2
+    Algorithm        string // SunX509
+}
+
+// SASL认证配置
+type SASLConfig struct {
+    Mechanism    string // PLAIN, SCRAM-SHA-256, GSSAPI
+    Username     string
+    Password     string
+    KerberosConfig *KerberosConfig
+}
+
+// 权限控制
+func (ksm *KafkaSecurityManager) SetupACLs() error {
+    // 1. 为不同角色设置权限
+    roles := []ACLRole{
+        {
+            Name: "producer",
+            Permissions: []Permission{
+                {Resource: "Topic:user-events", Operation: "WRITE"},
+                {Resource: "Topic:order-events", Operation: "WRITE"},
+            },
+        },
+        {
+            Name: "consumer",
+            Permissions: []Permission{
+                {Resource: "Topic:user-events", Operation: "READ"},
+                {Resource: "Group:analytics-group", Operation: "READ"},
+            },
+        },
+        {
+            Name: "admin",
+            Permissions: []Permission{
+                {Resource: "Cluster:kafka-cluster", Operation: "ALL"},
+            },
+        },
+    }
+    
+    for _, role := range roles {
+        if err := ksm.aclManager.CreateRole(role); err != nil {
+            return err
+        }
+    }
+    
+    return nil
+}
+
+// 审计日志
+func (ksm *KafkaSecurityManager) LogOperation(operation *AuditOperation) {
+    auditEntry := &AuditEntry{
+        Timestamp: time.Now(),
+        User:      operation.User,
+        Action:    operation.Action,
+        Resource:  operation.Resource,
+        Result:    operation.Result,
+        ClientIP:  operation.ClientIP,
+    }
+    
+    ksm.auditLog.Log(auditEntry)
+}
+```
+
+## 九、高频架构面试题
+
+### 1. Kafka vs RocketMQ vs Pulsar 技术选型对比
+
+| 维度 | Kafka | RocketMQ | Pulsar |
+|------|-------|----------|--------|
+| **架构模式** | 分布式日志 | 主从复制 | 存储计算分离 |
+| **消息顺序** | 分区内有序 | 全局有序(单队列) | 分区内有序 |
+| **延迟消息** | 不支持 | 原生支持 | 支持 |
+| **事务支持** | 支持 | 支持 | 支持 |
+| **多租户** | Topic级别 | Namespace | 原生支持 |
+| **存储模型** | 本地磁盘 | 本地磁盘 | BookKeeper |
+| **运维复杂度** | 中等 | 较低 | 较高 |
+| **生态成熟度** | 最成熟 | 中等 | 较新 |
+
+### 2. 大规模Kafka集群设计要点
+
+```go
+// 大规模集群设计考虑因素
+type LargeScaleDesign struct {
+    // 1. 容量规划
+    CapacityPlanning struct {
+        DailyVolume      int64  // 日消息量
+        PeakThroughput   int64  // 峰值吞吐量
+        RetentionPeriod  int    // 保留周期
+        ReplicationFactor int   // 副本因子
+        CompressionRatio float64 // 压缩比
+    }
+    
+    // 2. 网络架构
+    NetworkArchitecture struct {
+        BandwidthPerBroker int64  // 单Broker带宽
+        CrossRackLatency   int    // 跨机架延迟
+        NetworkTopology    string // 网络拓扑
+    }
+    
+    // 3. 存储架构
+    StorageArchitecture struct {
+        DiskType        string // SSD/HDD
+        RAIDLevel       string // RAID0/RAID10
+        FileSystem      string // ext4/xfs
+        MountOptions    string // noatime,nodiratime
+    }
+}
+
+// 性能调优建议
+func (lsd *LargeScaleDesign) GetTuningRecommendations() []string {
+    return []string{
+        "使用SSD存储提升IOPS性能",
+        "配置RAID0提升顺序写入性能",
+        "调整OS页缓存大小(vm.dirty_ratio)",
+        "使用lz4压缩平衡CPU和网络开销",
+        "合理设置分区数(CPU核数的2-3倍)",
+        "启用零拷贝(sendfile)减少内存拷贝",
+        "调整JVM堆大小(物理内存的25-50%)",
+        "使用G1GC减少停顿时间",
+    }
+}
+```
+
+### 3. Kafka在微服务架构中的最佳实践
+
+```go
+// 微服务事件驱动架构
+type EventDrivenArchitecture struct {
+    eventBus    *KafkaEventBus
+    sagaManager *SagaManager
+    cqrsHandler *CQRSHandler
+}
+
+// 事件总线设计
+type KafkaEventBus struct {
+    producer *kafka.Producer
+    consumer *kafka.Consumer
+    registry *EventRegistry
+}
+
+// 分布式事务Saga模式
+func (eda *EventDrivenArchitecture) HandleDistributedTransaction(sagaID string, events []Event) error {
+    saga := eda.sagaManager.CreateSaga(sagaID)
+    
+    for _, event := range events {
+        // 1. 发布事件
+        if err := eda.eventBus.PublishEvent(event); err != nil {
+            // 2. 执行补偿操作
+            return eda.sagaManager.Compensate(saga, event)
+        }
+        
+        // 3. 记录Saga状态
+        saga.RecordStep(event)
+    }
+    
+    return eda.sagaManager.CompleteSaga(saga)
+}
+
+// CQRS读写分离
+func (eda *EventDrivenArchitecture) HandleCommand(cmd Command) error {
+    // 1. 处理写命令
+    events, err := eda.cqrsHandler.ProcessCommand(cmd)
+    if err != nil {
+        return err
+    }
+    
+    // 2. 发布领域事件
+    for _, event := range events {
+        if err := eda.eventBus.PublishEvent(event); err != nil {
+            return err
+        }
+    }
+    
+    return nil
+}
+```
+
+## 十、注意事项与最佳实践
+
+### 1. 生产环境部署检查清单
+
+```bash
+#!/bin/bash
+# Kafka生产环境部署检查脚本
+
+echo "=== Kafka生产环境部署检查 ==="
+
+# 1. 硬件资源检查
+echo "1. 检查硬件资源..."
+echo "CPU核数: $(nproc)"
+echo "内存大小: $(free -h | grep Mem | awk '{print $2}')"
+echo "磁盘空间: $(df -h | grep /data)"
+echo "网络带宽: $(ethtool eth0 | grep Speed)"
+
+# 2. 操作系统配置检查
+echo "2. 检查操作系统配置..."
+echo "文件句柄限制: $(ulimit -n)"
+echo "Swap配置: $(cat /proc/sys/vm/swappiness)"
+echo "磁盘调度器: $(cat /sys/block/sda/queue/scheduler)"
+
+# 3. JVM配置检查
+echo "3. 检查JVM配置..."
+echo "堆内存设置: $KAFKA_HEAP_OPTS"
+echo "GC配置: $KAFKA_JVM_PERFORMANCE_OPTS"
+
+# 4. Kafka配置检查
+echo "4. 检查Kafka配置..."
+grep -E "(num.network.threads|num.io.threads|log.dirs|replication.factor)" /opt/kafka/config/server.properties
+
+# 5. 网络连通性检查
+echo "5. 检查网络连通性..."
+for broker in broker1:9092 broker2:9092 broker3:9092; do
+    nc -zv $broker
+done
+
+echo "=== 检查完成 ==="
+```
+
+### 2. 常见生产问题及解决方案
+
+| 问题类型 | 症状 | 根因分析 | 解决方案 |
+|----------|------|----------|----------|
+| **性能问题** | 吞吐量下降 | 磁盘IO瓶颈 | 使用SSD、调整刷盘策略 |
+| **延迟问题** | 消息延迟高 | 网络拥塞 | 调整batch.size、linger.ms |
+| **可用性问题** | 分区不可用 | ISR收缩 | 检查网络、调整replica.lag.time.max.ms |
+| **数据问题** | 消息丢失 | acks配置不当 | 设置acks=all、min.insync.replicas=2 |
+| **容量问题** | 磁盘满 | 日志清理不及时 | 调整retention策略、增加存储 |
+
+### 3. 监控告警阈值建议
+
+```yaml
+# Prometheus告警规则
+groups:
+- name: kafka.rules
+  rules:
+  - alert: KafkaUnderReplicatedPartitions
+    expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Kafka有副本不足的分区"
+      
+  - alert: KafkaConsumerLag
+    expr: kafka_consumer_lag_sum > 10000
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Kafka消费者积压过多"
+      
+  - alert: KafkaBrokerDown
+    expr: up{job="kafka"} == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Kafka Broker宕机"
+```
 
 
 

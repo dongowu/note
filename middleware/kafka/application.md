@@ -424,3 +424,899 @@ LogManager是Kafka Broker的日志管理核心组件，负责**日志段（Segme
 - **手动触发清理**：通过`kafka-log-dirs.sh --bootstrap-server localhost:9092 --topic-list my-topic --force-clean`命令强制清理；
 - **监控指标**：Prometheus的`kafka.logs.cleaned-bytes-total`（已清理字节数）、`kafka.logs.dirty-ratios`（待清理比例）；
 - **日志段检查**：使用`kafka-dump-log.sh --files /path/to/logs/*.log`查看压缩前后的消息分布。
+
+---
+
+## 企业级应用架构模式
+
+### 1. 事件驱动架构（Event-Driven Architecture, EDA）
+
+#### 1.1 架构设计原则
+事件驱动架构通过事件的发布和订阅实现系统间的松耦合通信，核心原则包括：
+- **事件优先**：业务操作产生事件，而非直接调用下游服务
+- **异步处理**：通过消息队列解耦时间依赖
+- **最终一致性**：接受短期数据不一致，通过事件传播达到最终一致
+
+#### 1.2 Go实现示例
+```go
+// 事件定义
+type OrderEvent struct {
+    EventID   string    `json:"event_id"`
+    EventType string    `json:"event_type"` // OrderCreated, OrderPaid, OrderShipped
+    OrderID   string    `json:"order_id"`
+    UserID    string    `json:"user_id"`
+    Amount    float64   `json:"amount"`
+    Timestamp time.Time `json:"timestamp"`
+}
+
+// 事件发布器
+type EventPublisher struct {
+    producer *kafka.Writer
+}
+
+func (ep *EventPublisher) PublishOrderEvent(event OrderEvent) error {
+    eventData, _ := json.Marshal(event)
+    return ep.producer.WriteMessages(context.Background(), kafka.Message{
+        Topic: "order-events",
+        Key:   []byte(event.OrderID), // 保证同一订单事件顺序
+        Value: eventData,
+        Headers: []kafka.Header{
+            {Key: "event-type", Value: []byte(event.EventType)},
+            {Key: "source", Value: []byte("order-service")},
+        },
+    })
+}
+
+// 事件处理器
+type InventoryEventHandler struct {
+    consumer *kafka.Reader
+    db       *sql.DB
+}
+
+func (ieh *InventoryEventHandler) HandleOrderEvents() {
+    for {
+        msg, err := ieh.consumer.ReadMessage(context.Background())
+        if err != nil {
+            log.Printf("Error reading message: %v", err)
+            continue
+        }
+        
+        var event OrderEvent
+        if err := json.Unmarshal(msg.Value, &event); err != nil {
+            log.Printf("Error unmarshaling event: %v", err)
+            continue
+        }
+        
+        switch event.EventType {
+        case "OrderCreated":
+            ieh.reserveInventory(event.OrderID, event.UserID)
+        case "OrderCancelled":
+            ieh.releaseInventory(event.OrderID)
+        }
+    }
+}
+
+func (ieh *InventoryEventHandler) reserveInventory(orderID, userID string) {
+    // 库存预留逻辑
+    tx, _ := ieh.db.Begin()
+    defer tx.Rollback()
+    
+    _, err := tx.Exec("UPDATE inventory SET reserved = reserved + 1 WHERE product_id = ?", orderID)
+    if err != nil {
+        // 发布库存不足事件
+        ieh.publishInventoryEvent("InventoryInsufficient", orderID)
+        return
+    }
+    
+    tx.Commit()
+    ieh.publishInventoryEvent("InventoryReserved", orderID)
+}
+```
+
+### 2. Saga分布式事务模式
+
+#### 2.1 Saga模式原理
+Saga模式通过一系列本地事务和补偿操作实现分布式事务，分为：
+- **编排式Saga（Orchestration）**：中央协调器管理事务流程
+- **编舞式Saga（Choreography）**：服务间通过事件自主协调
+
+#### 2.2 编排式Saga实现
+```go
+// Saga协调器
+type OrderSagaOrchestrator struct {
+    producer     *kafka.Writer
+    consumer     *kafka.Reader
+    sagaStore    map[string]*SagaInstance // 内存存储，生产环境建议用Redis
+}
+
+type SagaInstance struct {
+    SagaID       string
+    OrderID      string
+    CurrentStep  int
+    Steps        []SagaStep
+    Status       string // RUNNING, COMPLETED, COMPENSATING, FAILED
+    CompletedSteps []string
+}
+
+type SagaStep struct {
+    StepName     string
+    Service      string
+    Action       string
+    Compensation string
+}
+
+func (oso *OrderSagaOrchestrator) StartOrderSaga(orderID string) {
+    sagaID := uuid.New().String()
+    saga := &SagaInstance{
+        SagaID:  sagaID,
+        OrderID: orderID,
+        Status:  "RUNNING",
+        Steps: []SagaStep{
+            {StepName: "payment", Service: "payment-service", Action: "ProcessPayment", Compensation: "RefundPayment"},
+            {StepName: "inventory", Service: "inventory-service", Action: "ReserveInventory", Compensation: "ReleaseInventory"},
+            {StepName: "shipping", Service: "shipping-service", Action: "CreateShipment", Compensation: "CancelShipment"},
+        },
+    }
+    
+    oso.sagaStore[sagaID] = saga
+    oso.executeNextStep(saga)
+}
+
+func (oso *OrderSagaOrchestrator) executeNextStep(saga *SagaInstance) {
+    if saga.CurrentStep >= len(saga.Steps) {
+        saga.Status = "COMPLETED"
+        oso.publishSagaEvent("SagaCompleted", saga.SagaID, saga.OrderID)
+        return
+    }
+    
+    step := saga.Steps[saga.CurrentStep]
+    command := SagaCommand{
+        SagaID:    saga.SagaID,
+        OrderID:   saga.OrderID,
+        StepName:  step.StepName,
+        Action:    step.Action,
+        Service:   step.Service,
+    }
+    
+    commandData, _ := json.Marshal(command)
+    oso.producer.WriteMessages(context.Background(), kafka.Message{
+        Topic: fmt.Sprintf("%s-commands", step.Service),
+        Key:   []byte(saga.OrderID),
+        Value: commandData,
+    })
+}
+
+func (oso *OrderSagaOrchestrator) HandleSagaReply() {
+    for {
+        msg, err := oso.consumer.ReadMessage(context.Background())
+        if err != nil {
+            continue
+        }
+        
+        var reply SagaReply
+        json.Unmarshal(msg.Value, &reply)
+        
+        saga := oso.sagaStore[reply.SagaID]
+        if reply.Status == "SUCCESS" {
+            saga.CompletedSteps = append(saga.CompletedSteps, reply.StepName)
+            saga.CurrentStep++
+            oso.executeNextStep(saga)
+        } else {
+            // 开始补偿
+            saga.Status = "COMPENSATING"
+            oso.startCompensation(saga)
+        }
+    }
+}
+
+func (oso *OrderSagaOrchestrator) startCompensation(saga *SagaInstance) {
+    // 逆序执行补偿操作
+    for i := len(saga.CompletedSteps) - 1; i >= 0; i-- {
+        stepName := saga.CompletedSteps[i]
+        for _, step := range saga.Steps {
+            if step.StepName == stepName {
+                compensation := SagaCommand{
+                    SagaID:   saga.SagaID,
+                    OrderID:  saga.OrderID,
+                    StepName: step.StepName,
+                    Action:   step.Compensation,
+                    Service:  step.Service,
+                }
+                
+                compensationData, _ := json.Marshal(compensation)
+                oso.producer.WriteMessages(context.Background(), kafka.Message{
+                    Topic: fmt.Sprintf("%s-commands", step.Service),
+                    Key:   []byte(saga.OrderID),
+                    Value: compensationData,
+                })
+                break
+            }
+        }
+    }
+}
+```
+
+### 3. CQRS（命令查询责任分离）模式
+
+#### 3.1 CQRS架构设计
+CQRS将读操作（Query）和写操作（Command）分离，通过事件溯源实现数据同步：
+- **命令端**：处理业务写操作，产生事件
+- **查询端**：基于事件构建读模型，优化查询性能
+
+#### 3.2 Go实现示例
+```go
+// 命令处理器
+type OrderCommandHandler struct {
+    eventStore EventStore
+    producer   *kafka.Writer
+}
+
+type CreateOrderCommand struct {
+    OrderID   string
+    UserID    string
+    ProductID string
+    Quantity  int
+    Amount    float64
+}
+
+func (och *OrderCommandHandler) HandleCreateOrder(cmd CreateOrderCommand) error {
+    // 业务验证
+    if cmd.Amount <= 0 {
+        return errors.New("invalid amount")
+    }
+    
+    // 创建事件
+    event := OrderCreatedEvent{
+        EventID:   uuid.New().String(),
+        OrderID:   cmd.OrderID,
+        UserID:    cmd.UserID,
+        ProductID: cmd.ProductID,
+        Quantity:  cmd.Quantity,
+        Amount:    cmd.Amount,
+        Timestamp: time.Now(),
+    }
+    
+    // 持久化事件
+    if err := och.eventStore.SaveEvent(event); err != nil {
+        return err
+    }
+    
+    // 发布事件
+    eventData, _ := json.Marshal(event)
+    return och.producer.WriteMessages(context.Background(), kafka.Message{
+        Topic: "order-events",
+        Key:   []byte(cmd.OrderID),
+        Value: eventData,
+    })
+}
+
+// 查询端投影器
+type OrderProjectionHandler struct {
+    consumer *kafka.Reader
+    readDB   *sql.DB
+}
+
+func (oph *OrderProjectionHandler) BuildOrderProjections() {
+    for {
+        msg, err := oph.consumer.ReadMessage(context.Background())
+        if err != nil {
+            continue
+        }
+        
+        var event OrderCreatedEvent
+        if err := json.Unmarshal(msg.Value, &event); err != nil {
+            continue
+        }
+        
+        // 更新读模型
+        oph.updateOrderView(event)
+        oph.updateUserOrderSummary(event)
+        oph.updateProductSalesStats(event)
+    }
+}
+
+func (oph *OrderProjectionHandler) updateOrderView(event OrderCreatedEvent) {
+    query := `
+        INSERT INTO order_view (order_id, user_id, product_id, quantity, amount, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'CREATED', ?)
+    `
+    oph.readDB.Exec(query, event.OrderID, event.UserID, event.ProductID, 
+                   event.Quantity, event.Amount, event.Timestamp)
+}
+
+func (oph *OrderProjectionHandler) updateUserOrderSummary(event OrderCreatedEvent) {
+    query := `
+        INSERT INTO user_order_summary (user_id, total_orders, total_amount)
+        VALUES (?, 1, ?)
+        ON DUPLICATE KEY UPDATE 
+        total_orders = total_orders + 1,
+        total_amount = total_amount + VALUES(total_amount)
+    `
+    oph.readDB.Exec(query, event.UserID, event.Amount)
+}
+```
+
+### 4. 微服务通信模式
+
+#### 4.1 异步消息通信
+```go
+// 服务间异步通信管理器
+type ServiceCommunicationManager struct {
+    producer *kafka.Writer
+    consumer *kafka.Reader
+    handlers map[string]MessageHandler
+}
+
+type MessageHandler interface {
+    Handle(message []byte) error
+}
+
+// 用户服务
+type UserService struct {
+    db       *sql.DB
+    commMgr  *ServiceCommunicationManager
+}
+
+func (us *UserService) CreateUser(user User) error {
+    // 本地事务
+    tx, _ := us.db.Begin()
+    defer tx.Rollback()
+    
+    _, err := tx.Exec("INSERT INTO users (id, name, email) VALUES (?, ?, ?)", 
+                     user.ID, user.Name, user.Email)
+    if err != nil {
+        return err
+    }
+    
+    tx.Commit()
+    
+    // 发布用户创建事件
+    event := UserCreatedEvent{
+        UserID:    user.ID,
+        Name:      user.Name,
+        Email:     user.Email,
+        Timestamp: time.Now(),
+    }
+    
+    return us.commMgr.PublishEvent("user-events", event)
+}
+
+// 通知服务处理用户事件
+type NotificationService struct {
+    emailSender EmailSender
+}
+
+func (ns *NotificationService) Handle(message []byte) error {
+    var event UserCreatedEvent
+    if err := json.Unmarshal(message, &event); err != nil {
+        return err
+    }
+    
+    // 发送欢迎邮件
+    return ns.emailSender.SendWelcomeEmail(event.Email, event.Name)
+}
+
+// 服务发现与负载均衡
+type ServiceRegistry struct {
+    services map[string][]ServiceInstance
+    mu       sync.RWMutex
+}
+
+type ServiceInstance struct {
+    ID       string
+    Address  string
+    Port     int
+    Health   string
+    LastSeen time.Time
+}
+
+func (sr *ServiceRegistry) RegisterService(serviceName string, instance ServiceInstance) {
+    sr.mu.Lock()
+    defer sr.mu.Unlock()
+    
+    if sr.services[serviceName] == nil {
+        sr.services[serviceName] = make([]ServiceInstance, 0)
+    }
+    
+    sr.services[serviceName] = append(sr.services[serviceName], instance)
+}
+
+func (sr *ServiceRegistry) GetHealthyInstances(serviceName string) []ServiceInstance {
+    sr.mu.RLock()
+    defer sr.mu.RUnlock()
+    
+    instances := sr.services[serviceName]
+    healthy := make([]ServiceInstance, 0)
+    
+    for _, instance := range instances {
+        if instance.Health == "UP" && time.Since(instance.LastSeen) < 30*time.Second {
+            healthy = append(healthy, instance)
+        }
+    }
+    
+    return healthy
+}
+```
+
+### 5. 实时流处理架构
+
+#### 5.1 Kafka Streams实现
+```go
+// 实时数据处理管道
+type StreamProcessor struct {
+    consumer *kafka.Reader
+    producer *kafka.Writer
+    windows  map[string]*TimeWindow
+    mu       sync.RWMutex
+}
+
+type TimeWindow struct {
+    StartTime time.Time
+    EndTime   time.Time
+    Data      map[string]interface{}
+}
+
+// 实时用户行为分析
+func (sp *StreamProcessor) ProcessUserBehavior() {
+    for {
+        msg, err := sp.consumer.ReadMessage(context.Background())
+        if err != nil {
+            continue
+        }
+        
+        var event UserBehaviorEvent
+        if err := json.Unmarshal(msg.Value, &event); err != nil {
+            continue
+        }
+        
+        // 滑动窗口聚合
+        sp.aggregateInWindow(event)
+        
+        // 实时异常检测
+        if sp.detectAnomaly(event) {
+            sp.publishAlert(event)
+        }
+    }
+}
+
+func (sp *StreamProcessor) aggregateInWindow(event UserBehaviorEvent) {
+    windowKey := fmt.Sprintf("%s_%d", event.UserID, event.Timestamp.Unix()/300) // 5分钟窗口
+    
+    sp.mu.Lock()
+    defer sp.mu.Unlock()
+    
+    window, exists := sp.windows[windowKey]
+    if !exists {
+        window = &TimeWindow{
+            StartTime: time.Unix(event.Timestamp.Unix()/300*300, 0),
+            EndTime:   time.Unix(event.Timestamp.Unix()/300*300+300, 0),
+            Data:      make(map[string]interface{}),
+        }
+        sp.windows[windowKey] = window
+    }
+    
+    // 聚合计算
+    if count, ok := window.Data["click_count"].(int); ok {
+        window.Data["click_count"] = count + 1
+    } else {
+        window.Data["click_count"] = 1
+    }
+    
+    // 窗口关闭时输出结果
+    if time.Now().After(window.EndTime) {
+        sp.outputWindowResult(windowKey, window)
+        delete(sp.windows, windowKey)
+    }
+}
+
+func (sp *StreamProcessor) detectAnomaly(event UserBehaviorEvent) bool {
+    // 简单异常检测：5分钟内点击超过100次
+    windowKey := fmt.Sprintf("%s_%d", event.UserID, event.Timestamp.Unix()/300)
+    
+    sp.mu.RLock()
+    window, exists := sp.windows[windowKey]
+    sp.mu.RUnlock()
+    
+    if exists {
+        if count, ok := window.Data["click_count"].(int); ok && count > 100 {
+            return true
+        }
+    }
+    
+    return false
+}
+```
+
+---
+
+## 生产环境最佳实践
+
+### 1. 配置模板
+
+#### 1.1 高吞吐量场景配置
+```yaml
+# producer.yml - 高吞吐量生产者配置
+kafka:
+  producer:
+    bootstrap.servers: "kafka-cluster:9092"
+    acks: "1"                    # 平衡可靠性与性能
+    retries: 3
+    batch.size: 65536            # 64KB批次大小
+    linger.ms: 20                # 20ms延迟发送
+    buffer.memory: 134217728     # 128MB缓冲区
+    compression.type: "lz4"      # LZ4压缩，CPU开销小
+    max.in.flight.requests.per.connection: 5
+    enable.idempotence: true
+    
+  consumer:
+    bootstrap.servers: "kafka-cluster:9092"
+    group.id: "high-throughput-group"
+    auto.offset.reset: "latest"
+    enable.auto.commit: false    # 手动提交提升性能
+    max.poll.records: 1000       # 单次拉取1000条消息
+    fetch.min.bytes: 50000       # 最小拉取50KB
+    fetch.max.wait.ms: 500       # 最大等待500ms
+    session.timeout.ms: 30000
+    heartbeat.interval.ms: 10000
+```
+
+#### 1.2 低延迟场景配置
+```yaml
+# producer.yml - 低延迟生产者配置
+kafka:
+  producer:
+    bootstrap.servers: "kafka-cluster:9092"
+    acks: "1"
+    retries: 0                   # 禁用重试减少延迟
+    batch.size: 1024             # 小批次
+    linger.ms: 0                 # 立即发送
+    buffer.memory: 33554432      # 32MB缓冲区
+    compression.type: "none"     # 无压缩
+    max.in.flight.requests.per.connection: 1
+    
+  consumer:
+    bootstrap.servers: "kafka-cluster:9092"
+    group.id: "low-latency-group"
+    auto.offset.reset: "latest"
+    enable.auto.commit: true
+    auto.commit.interval.ms: 1000
+    max.poll.records: 100        # 小批次消费
+    fetch.min.bytes: 1           # 立即返回
+    fetch.max.wait.ms: 10        # 最大等待10ms
+    session.timeout.ms: 10000
+    heartbeat.interval.ms: 3000
+```
+
+#### 1.3 高可靠性场景配置
+```yaml
+# producer.yml - 高可靠性生产者配置
+kafka:
+  producer:
+    bootstrap.servers: "kafka-cluster:9092"
+    acks: "all"                  # 等待所有副本确认
+    retries: 2147483647          # 最大重试次数
+    retry.backoff.ms: 1000
+    batch.size: 16384
+    linger.ms: 100
+    buffer.memory: 67108864      # 64MB缓冲区
+    compression.type: "gzip"     # GZIP压缩节省存储
+    max.in.flight.requests.per.connection: 1  # 保证顺序
+    enable.idempotence: true
+    transactional.id: "tx-producer-1"  # 事务支持
+    
+  consumer:
+    bootstrap.servers: "kafka-cluster:9092"
+    group.id: "reliable-group"
+    auto.offset.reset: "earliest"
+    enable.auto.commit: false    # 手动提交保证可靠性
+    isolation.level: "read_committed"  # 只读已提交事务
+    max.poll.records: 100
+    session.timeout.ms: 45000
+    heartbeat.interval.ms: 15000
+    request.timeout.ms: 60000
+```
+
+### 2. 监控指标配置
+
+#### 2.1 Prometheus监控规则
+```yaml
+# kafka-alerts.yml
+groups:
+- name: kafka.application.rules
+  rules:
+  # 消息积压告警
+  - alert: KafkaConsumerLag
+    expr: kafka_consumer_lag_sum > 10000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Kafka consumer lag is high"
+      description: "Consumer group {{ $labels.group }} has lag {{ $value }} on topic {{ $labels.topic }}"
+      
+  # 生产者错误率告警
+  - alert: KafkaProducerErrorRate
+    expr: rate(kafka_producer_record_error_total[5m]) > 0.01
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Kafka producer error rate is high"
+      description: "Producer error rate is {{ $value }} errors/sec"
+      
+  # 消费者重平衡频繁告警
+  - alert: KafkaFrequentRebalance
+    expr: rate(kafka_consumer_rebalance_total[10m]) > 0.1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Kafka consumer rebalancing frequently"
+      description: "Consumer group {{ $labels.group }} is rebalancing {{ $value }} times per minute"
+      
+  # 事务失败告警
+  - alert: KafkaTransactionFailure
+    expr: rate(kafka_producer_transaction_aborted_total[5m]) > 0.05
+    for: 3m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Kafka transaction failure rate is high"
+      description: "Transaction abort rate is {{ $value }} per second"
+      
+  # 连接数告警
+  - alert: KafkaConnectionCount
+    expr: kafka_server_socket_server_metrics_connection_count > 1000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Kafka connection count is high"
+      description: "Broker has {{ $value }} active connections"
+```
+
+#### 2.2 应用层监控指标
+```go
+// 应用监控指标收集器
+type ApplicationMetrics struct {
+    // 业务指标
+    OrderProcessedTotal   prometheus.Counter
+    OrderProcessingTime   prometheus.Histogram
+    PaymentSuccessRate    prometheus.Gauge
+    InventoryUpdateLag    prometheus.Gauge
+    
+    // 技术指标
+    MessageProcessingTime prometheus.Histogram
+    DeadLetterQueueSize   prometheus.Gauge
+    CircuitBreakerState   prometheus.Gauge
+    RetryAttempts         prometheus.Counter
+}
+
+func NewApplicationMetrics() *ApplicationMetrics {
+    return &ApplicationMetrics{
+        OrderProcessedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+            Name: "orders_processed_total",
+            Help: "Total number of orders processed",
+        }),
+        OrderProcessingTime: prometheus.NewHistogram(prometheus.HistogramOpts{
+            Name:    "order_processing_duration_seconds",
+            Help:    "Time spent processing orders",
+            Buckets: prometheus.DefBuckets,
+        }),
+        PaymentSuccessRate: prometheus.NewGauge(prometheus.GaugeOpts{
+            Name: "payment_success_rate",
+            Help: "Payment success rate in last 5 minutes",
+        }),
+        MessageProcessingTime: prometheus.NewHistogram(prometheus.HistogramOpts{
+            Name:    "kafka_message_processing_duration_seconds",
+            Help:    "Time spent processing Kafka messages",
+            Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0},
+        }),
+        DeadLetterQueueSize: prometheus.NewGauge(prometheus.GaugeOpts{
+            Name: "dead_letter_queue_size",
+            Help: "Number of messages in dead letter queue",
+        }),
+    }
+}
+
+// 监控中间件
+func (am *ApplicationMetrics) MonitorMessageProcessing(handler MessageHandler) MessageHandler {
+    return func(message []byte) error {
+        start := time.Now()
+        defer func() {
+            am.MessageProcessingTime.Observe(time.Since(start).Seconds())
+        }()
+        
+        err := handler(message)
+        if err != nil {
+            am.RetryAttempts.Inc()
+        }
+        
+        return err
+    }
+}
+```
+
+### 3. 部署与运维最佳实践
+
+#### 3.1 容器化部署配置
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  order-service:
+    image: order-service:latest
+    environment:
+      - KAFKA_BROKERS=kafka-cluster:9092
+      - DB_HOST=postgres:5432
+      - REDIS_HOST=redis:6379
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 512M
+          cpus: '0.25'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - kafka-network
+      
+  inventory-service:
+    image: inventory-service:latest
+    environment:
+      - KAFKA_BROKERS=kafka-cluster:9092
+      - DB_HOST=postgres:5432
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.3'
+    networks:
+      - kafka-network
+      
+networks:
+  kafka-network:
+    driver: overlay
+    attachable: true
+```
+
+#### 3.2 Kubernetes部署配置
+```yaml
+# k8s-deployment.yml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  labels:
+    app: order-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+      - name: order-service
+        image: order-service:v1.2.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: KAFKA_BROKERS
+          value: "kafka-cluster:9092"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: password
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  selector:
+    app: order-service
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+```
+
+#### 3.3 运维脚本
+```bash
+#!/bin/bash
+# kafka-ops.sh - Kafka运维脚本
+
+# 检查消费者组状态
+check_consumer_groups() {
+    echo "=== Consumer Groups Status ==="
+    kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list | while read group; do
+        echo "Group: $group"
+        kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group $group --describe
+        echo "---"
+    done
+}
+
+# 重置消费者组偏移量
+reset_consumer_offset() {
+    local group=$1
+    local topic=$2
+    local offset=$3
+    
+    echo "Resetting offset for group $group on topic $topic to $offset"
+    kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+        --group $group --topic $topic --reset-offsets --to-offset $offset --execute
+}
+
+# 监控Topic大小
+monitor_topic_size() {
+    echo "=== Topic Sizes ==="
+    kafka-log-dirs.sh --bootstrap-server localhost:9092 --describe --json | \
+    jq -r '.brokers[].logDirs[].partitions[] | "\(.topic)-\(.partition): \(.size) bytes"' | \
+    sort
+}
+
+# 清理过期日志
+cleanup_logs() {
+    local retention_days=$1
+    echo "Cleaning up logs older than $retention_days days"
+    
+    find /var/kafka-logs -name "*.log" -mtime +$retention_days -delete
+    find /var/kafka-logs -name "*.index" -mtime +$retention_days -delete
+    find /var/kafka-logs -name "*.timeindex" -mtime +$retention_days -delete
+}
+
+# 主函数
+case "$1" in
+    "check-groups")
+        check_consumer_groups
+        ;;
+    "reset-offset")
+        reset_consumer_offset $2 $3 $4
+        ;;
+    "monitor-size")
+        monitor_topic_size
+        ;;
+    "cleanup")
+        cleanup_logs ${2:-7}
+        ;;
+    *)
+        echo "Usage: $0 {check-groups|reset-offset|monitor-size|cleanup}"
+        echo "  check-groups: Check all consumer group status"
+        echo "  reset-offset <group> <topic> <offset>: Reset consumer group offset"
+        echo "  monitor-size: Monitor topic sizes"
+        echo "  cleanup [days]: Cleanup logs older than specified days (default: 7)"
+        exit 1
+        ;;
+esac
+```
