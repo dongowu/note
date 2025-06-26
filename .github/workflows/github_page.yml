@@ -1,4 +1,4 @@
-name: Build and Deploy GitBook to GitHub Pages
+name: Build and Deploy GitBook (via Docker)
 
 on:
   push:
@@ -16,17 +16,7 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v3
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: '16'
-
-    - name: Install GitBook CLI
-      run: |
-        npm install -g gitbook-cli
-        gitbook fetch 3.2.3
-
-    - name: Auto-generate SUMMARY.md
+    - name: Generate SUMMARY.md automatically
       run: |
         echo "# Summary" > SUMMARY.md
         echo "" >> SUMMARY.md
@@ -35,12 +25,17 @@ jobs:
         find . -type f -name "*.md" ! -name "README.md" ! -name "SUMMARY.md" \
           | sort \
           | while read file; do
-              title=$(head -1 "$file" | sed 's/#//g' | xargs)
+              title=$(head -1 "$file" | sed 's/^#* //g' | xargs)
               echo "* [$title](${file#./})" >> SUMMARY.md
             done
 
-    - name: Build GitBook
-      run: gitbook build
+    - name: Build GitBook using Docker
+      run: |
+        docker run --rm \
+          -v ${{ github.workspace }}:/gitbook \
+          -w /gitbook \
+          fellah/gitbook:v3.2.3 \
+          /bin/sh -c "gitbook install && gitbook build"
 
     - name: Deploy to GitHub Pages
       uses: peaceiris/actions-gh-pages@v3
