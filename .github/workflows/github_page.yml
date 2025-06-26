@@ -1,0 +1,49 @@
+name: Build and Deploy GitBook to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '16'
+
+    - name: Install GitBook CLI
+      run: |
+        npm install -g gitbook-cli
+        gitbook fetch 3.2.3
+
+    - name: Auto-generate SUMMARY.md
+      run: |
+        echo "# Summary" > SUMMARY.md
+        echo "" >> SUMMARY.md
+        echo "* [首页](README.md)" >> SUMMARY.md
+
+        find . -type f -name "*.md" ! -name "README.md" ! -name "SUMMARY.md" \
+          | sort \
+          | while read file; do
+              title=$(head -1 "$file" | sed 's/#//g' | xargs)
+              echo "* [$title](${file#./})" >> SUMMARY.md
+            done
+
+    - name: Build GitBook
+      run: gitbook build
+
+    - name: Deploy to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./_book
