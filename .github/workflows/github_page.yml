@@ -34,7 +34,7 @@ jobs:
         docker run --rm \
           -v ${{ github.workspace }}:/gitbook \
           -w /gitbook \
-          mzrsh/gitbook \
+           fellah/gitbook:v3.2.3 \
           bash -c "gitbook install && gitbook build"
 
     - name: Deploy to GitHub Pages
