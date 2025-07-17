@@ -75,12 +75,12 @@ func (s *CloudNativeAnnotationService) CreateWithEdgeOptimization(ann *Annotatio
     // 1. 就近边缘节点处理
     region := s.detectUserRegion(ann.UserID)
     edgeClient := s.edgeCache[region]
-    
+
     // 2. 边缘预处理（减少中心节点压力）
     if err := s.preProcessAtEdge(edgeClient, ann); err != nil {
         return err
     }
-    
+
     // 3. 异步同步至中心（最终一致性）
     return s.syncToCenter(ann)
 }
@@ -110,21 +110,21 @@ type TechDebtAnalyzer struct {
 
 func (t *TechDebtAnalyzer) AnalyzeDebt(projectPath string) *DebtReport {
     report := &DebtReport{}
-    
+
     // 1. 圈复杂度检测（>10为高风险）
     for file, complexity := range t.codeComplexity {
         if complexity > 10 {
             report.HighComplexityFiles = append(report.HighComplexityFiles, file)
         }
     }
-    
+
     // 2. 测试覆盖率检测（<80%为风险）
     for file, coverage := range t.testCoverage {
         if coverage < 0.8 {
             report.LowCoverageFiles = append(report.LowCoverageFiles, file)
         }
     }
-    
+
     return report
 }
 ```
@@ -323,26 +323,26 @@ func (u *LargeFileUploader) UploadWithResume(filePath string, videoID string) er
         return err
     }
     defer file.Close()
-    
+
     fileInfo, _ := file.Stat()
     totalChunks := int(math.Ceil(float64(fileInfo.Size()) / float64(u.chunkSize)))
-    
+
     // 并发上传分片
     semaphore := make(chan struct{}, u.concurrency)
     var wg sync.WaitGroup
-    
+
     for i := 0; i < totalChunks; i++ {
         wg.Add(1)
         go func(chunkIndex int) {
             defer wg.Done()
             semaphore <- struct{}{} // 获取信号量
             defer func() { <-semaphore }() // 释放信号量
-            
+
             // 上传单个分片
             u.uploadChunk(file, chunkIndex, videoID)
         }(i)
     }
-    
+
     wg.Wait()
     return u.mergeChunks(videoID, totalChunks)
 }
@@ -372,14 +372,14 @@ func (u *LargeFileUploader) resumeUpload(videoID string) error {
     if err != nil {
         return err
     }
-    
+
     // 2. 只上传缺失分片
     for chunkIndex := range u.getMissingChunks(uploadedChunks) {
         if err := u.uploadChunk(file, chunkIndex, videoID); err != nil {
             return fmt.Errorf("上传分片%d失败: %v", chunkIndex, err)
         }
     }
-    
+
     return nil
 }
 ```
@@ -402,7 +402,7 @@ type AnnotationRecommender struct {
 func (r *AnnotationRecommender) RecommendAnnotations(userID, videoID string, timestamp float64) ([]*Annotation, error) {
     // 1. 获取用户兴趣向量
     userVector := r.userProfile[userID]
-    
+
     // 2. 查询相似批注（基于语义相似度）
     query := &milvus.SearchParam{
         CollectionName: "annotations",
@@ -413,12 +413,12 @@ func (r *AnnotationRecommender) RecommendAnnotations(userID, videoID string, tim
             "timestamp_range": [2]float64{timestamp - 30, timestamp + 30}, // 前后30秒
         },
     }
-    
+
     results, err := r.vectorDB.Search(query)
     if err != nil {
         return nil, err
     }
-    
+
     // 3. 过滤和排序
     return r.filterAndRank(results, userVector), nil
 }
@@ -446,10 +446,10 @@ func (r *AnnotationRecommender) HandleColdStart(userID string) *UserVector {
     // 1. 基于用户注册信息构建初始画像
     user := r.getUserInfo(userID)
     initialVector := r.buildInitialVector(user.Age, user.Education, user.Interests)
-    
+
     // 2. 基于热门内容推荐
     popularAnnotations := r.getPopularAnnotations()
-    
+
     // 3. 逐步学习用户偏好
     return &UserVector{
         Embedding: initialVector,
@@ -478,12 +478,12 @@ CREATE TABLE annotations (
     coordinates JSON,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
+
     -- 核心查询索引
     INDEX idx_video_timestamp (video_id, timestamp_ms),
     INDEX idx_video_frame (video_id, frame_number),
     INDEX idx_user_created (user_id, created_at),
-    
+
     -- 复合查询索引
     INDEX idx_video_user_time (video_id, user_id, timestamp_ms)
 );
@@ -503,22 +503,22 @@ type AnnotationQuery struct {
 func (repo *AnnotationRepo) QueryWithCursor(query *AnnotationQuery) ([]*Annotation, error) {
     sql := `
         SELECT id, video_id, user_id, timestamp_ms, content, coordinates
-        FROM annotations 
-        WHERE video_id = ? 
+        FROM annotations
+        WHERE video_id = ?
         AND timestamp_ms BETWEEN ? AND ?
         AND id > ?  -- 游标分页，避免OFFSET
         ORDER BY id ASC
         LIMIT ?
     `
-    
-    rows, err := repo.db.Query(sql, 
-        query.VideoID, 
-        query.TimeRange[0], 
+
+    rows, err := repo.db.Query(sql,
+        query.VideoID,
+        query.TimeRange[0],
         query.TimeRange[1],
         query.LastID,
         query.Limit,
     )
-    
+
     return repo.scanAnnotations(rows), err
 }
 ```
@@ -540,20 +540,20 @@ func (c *MultiLevelCache) Get(key string) (interface{}, error) {
     if value, ok := c.l1Cache.Load(key); ok {
         return value, nil
     }
-    
+
     // L2: Redis缓存
     if value, err := c.l2Cache.Get(key).Result(); err == nil {
         c.l1Cache.Store(key, value) // 回填L1
         return value, nil
     }
-    
+
     // L3: Memcached缓存
     if value, err := c.l3Cache.Get(key); err == nil {
         c.l2Cache.Set(key, value, time.Hour)     // 回填L2
         c.l1Cache.Store(key, value)              // 回填L1
         return value, nil
     }
-    
+
     return nil, errors.New("cache miss")
 }
 ```
@@ -570,30 +570,30 @@ type CacheWarmer struct {
 func (w *CacheWarmer) WarmupPopularContent() error {
     // 1. 分析热门视频（基于访问量）
     popularVideos := w.analytics.GetPopularVideos(24 * time.Hour, 100)
-    
+
     // 2. 预加载热门批注
     for _, video := range popularVideos {
         annotations, err := w.loadAnnotations(video.ID)
         if err != nil {
             continue
         }
-        
+
         // 3. 分时间段缓存（减少内存压力）
         w.cacheByTimeSegments(video.ID, annotations)
     }
-    
+
     return nil
 }
 
 func (w *CacheWarmer) cacheByTimeSegments(videoID string, annotations []*Annotation) {
     // 按30秒分段缓存
     segments := make(map[int][]*Annotation)
-    
+
     for _, ann := range annotations {
         segmentIndex := int(ann.TimestampMs / 30000) // 30秒一段
         segments[segmentIndex] = append(segments[segmentIndex], ann)
     }
-    
+
     for segmentIndex, segmentAnnotations := range segments {
         key := fmt.Sprintf("annotations:%s:segment:%d", videoID, segmentIndex)
         w.cache.Set(key, segmentAnnotations, time.Hour)
@@ -619,14 +619,14 @@ func (p *CapacityPlanner) CalculateStorageNeeds(users int, videosPerUser int, an
     // 1. 基础存储需求
     totalAnnotations := int64(users * videosPerUser * annotationsPerVideo)
     baseStorage := totalAnnotations * p.avgAnnotationSize
-    
+
     // 2. 考虑峰值和冗余
     peakStorage := int64(float64(baseStorage) * p.peakMultiplier)
     redundantStorage := peakStorage * 3 // 3副本
-    
+
     // 3. 缓存需求（热数据20%）
     cacheStorage := int64(float64(redundantStorage) * 0.2)
-    
+
     return &CapacityPlan{
         BaseStorage:      baseStorage,
         PeakStorage:      peakStorage,
@@ -652,17 +652,17 @@ func (a *AutoScaler) ScaleBasedOnMetrics() error {
     memoryUsage := a.metrics.GetMemoryUsage()
     qps := a.metrics.GetQPS()
     latency := a.metrics.GetP99Latency()
-    
+
     // 2. 扩容决策
     shouldScale := cpuUsage > 70 || memoryUsage > 80 || latency > 200
-    
+
     if shouldScale {
         currentReplicas := a.getCurrentReplicas("annotation-service")
         targetReplicas := int32(math.Min(float64(currentReplicas*2), 50)) // 最大50个副本
-        
+
         return a.updateReplicas("annotation-service", targetReplicas)
     }
-    
+
     return nil
 }
 ```
@@ -686,7 +686,7 @@ func (cb *CircuitBreaker) Call(fn func() (interface{}, error)) (interface{}, err
     cb.mutex.RLock()
     state := atomic.LoadInt32(&cb.state)
     cb.mutex.RUnlock()
-    
+
     switch state {
     case 0: // Closed
         return cb.callClosed(fn)
@@ -709,7 +709,7 @@ func (cb *CircuitBreaker) callClosed(fn func() (interface{}, error)) (interface{
         }
         return nil, err
     }
-    
+
     atomic.StoreInt32(&cb.failures, 0)
     return result, nil
 }
@@ -732,14 +732,14 @@ func (bm *BackupManager) SetupAutoBackup() error {
             log.Errorf("全量备份失败: %v", err)
         }
     })
-    
+
     // 2. 每小时增量备份
     bm.scheduler.AddFunc("0 * * * *", func() {
         if err := bm.incrementalBackup(); err != nil {
             log.Errorf("增量备份失败: %v", err)
         }
     })
-    
+
     bm.scheduler.Start()
     return nil
 }
@@ -747,25 +747,25 @@ func (bm *BackupManager) SetupAutoBackup() error {
 func (bm *BackupManager) fullBackup() error {
     // 1. 导出数据库
     backupFile := fmt.Sprintf("backup_full_%s.sql", time.Now().Format("20060102_150405"))
-    cmd := exec.Command("mysqldump", 
+    cmd := exec.Command("mysqldump",
         "-h", "localhost",
         "-u", "backup_user",
         "-p", "password",
         "annotation_db",
     )
-    
+
     output, err := cmd.Output()
     if err != nil {
         return fmt.Errorf("mysqldump失败: %v", err)
     }
-    
+
     // 2. 上传到S3
     _, err = bm.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
         Bucket: aws.String("annotation-backups"),
         Key:    aws.String(backupFile),
         Body:   bytes.NewReader(output),
     })
-    
+
     return err
 }
 ```
@@ -813,27 +813,27 @@ func (bm *BackupManager) fullBackup() error {
 // 面试题：实现批注冲突检测算法
 func DetectAnnotationConflicts(annotations []*Annotation) [][]*Annotation {
     conflicts := make([][]*Annotation, 0)
-    
+
     // 按时间戳排序
     sort.Slice(annotations, func(i, j int) bool {
         return annotations[i].Timestamp < annotations[j].Timestamp
     })
-    
+
     // 检测重叠区域
     for i := 0; i < len(annotations); i++ {
         conflictGroup := []*Annotation{annotations[i]}
-        
+
         for j := i + 1; j < len(annotations); j++ {
             if isOverlapping(annotations[i], annotations[j]) {
                 conflictGroup = append(conflictGroup, annotations[j])
             }
         }
-        
+
         if len(conflictGroup) > 1 {
             conflicts = append(conflicts, conflictGroup)
         }
     }
-    
+
     return conflicts
 }
 
@@ -843,7 +843,7 @@ func isOverlapping(ann1, ann2 *Annotation) bool {
     if timeDiff > 1.0 {
         return false
     }
-    
+
     // 空间重叠检测（矩形相交）
     return rectIntersect(ann1.Coordinates, ann2.Coordinates)
 }
@@ -893,4 +893,3 @@ func isOverlapping(ann1, ann2 *Annotation) bool {
 2. **低带宽下的批注压缩**：在50kbps极端带宽下，如何将批注消息体积压缩至100字节/条？（可能方案：使用Delta编码，仅传输变化的坐标差值）
 3. **批注权限控制**：如何限制普通用户修改管理员的批注？（可能方案：在批注数据中添加`creator_role`字段，服务端校验`user.role ≥ creator_role`才允许修改）
 4. **历史批注回溯**：用户需要查看7天前某帧的所有批注，如何设计存储策略？（可能方案：Elasticsearch热温冷架构，7天内数据存SSD（热节点），7-30天存HDD（温节点），30天后归档至S3（冷存储））
-
